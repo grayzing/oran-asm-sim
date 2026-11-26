@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oran-asm-sim"
+version = "0.2.0"
+description = "Vectorised 3GPP-style SLS for per-sector O-RU Advanced Sleep Mode control (Gymnasium / RLlib)"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.24", "scipy>=1.9"]
+
+[project.optional-dependencies]
+gym = ["gymnasium>=0.29"]
+rllib = ["gymnasium>=0.29", "ray[rllib]>=2.40", "torch"]
+viz = ["matplotlib>=3.6"]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["oran_asm_sim", "oran_asm_sim.vdn"]
+
+[tool.pytest.ini_options]
+filterwarnings = ["ignore:.*SYNTHETIC.*:UserWarning"]

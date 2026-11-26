@@ -1,0 +1,57 @@
+{
+  "always-on (no ASM)": {
+    "energy_kwh_per_day": 708.4771075002633,
+    "saving_vs_always_on": 0.0,
+    "qos_violation": 0.0046468621399176945,
+    "busy_hour_qos_violation": 0.012461728395061728,
+    "outage": 0.026611111111111113,
+    "served_over_offered": 0.9694492434187426,
+    "mean_wake_latency_ms": 0.0,
+    "ue_tput_p5_mbps": 0.08897241246471507,
+    "mean_reward": -0.6722713671347483
+  },
+  "opportunistic SM1": {
+    "energy_kwh_per_day": 499.3102425817218,
+    "saving_vs_always_on": 0.2952344722281146,
+    "qos_violation": 0.0046634773662551435,
+    "busy_hour_qos_violation": 0.013011111111111109,
+    "outage": 0.02663683127572017,
+    "served_over_offered": 0.969720926735717,
+    "mean_wake_latency_ms": 0.022253393952872014,
+    "ue_tput_p5_mbps": 0.0353946015843368,
+    "mean_reward": -0.5097362990654037
+  },
+  "opportunistic SM2": {
+    "energy_kwh_per_day": 386.60992571364363,
+    "saving_vs_always_on": 0.45430851382378656,
+    "qos_violation": 0.004482510288065843,
+    "busy_hour_qos_violation": 0.013512345679012347,
+    "outage": 0.02672222222222222,
+    "served_over_offered": 0.9697823138235627,
+    "mean_wake_latency_ms": 0.312642926569363,
+    "ue_tput_p5_mbps": 0.04927658822276361,
+    "mean_reward": -0.4220025915313366
+  },
+  "opportunistic SM3": {
+    "energy_kwh_per_day": 446.4056147941271,
+    "saving_vs_always_on": 0.36990820159427495,
+    "qos_violation": 0.004718878600823046,
+    "busy_hour_qos_violation": 0.013027160493827161,
+    "outage": 0.026675925925925926,
+    "served_over_offered": 0.9700105179199142,
+    "mean_wake_latency_ms": 2.661473210405918,
+    "ue_tput_p5_mbps": 0.020684358743650356,
+    "mean_reward": -0.46860104180607576
+  },
+  "threshold SM4 + SM2": {
+    "energy_kwh_per_day": 376.52269141652897,
+    "saving_vs_always_on": 0.46854642524015633,
+    "qos_violation": 0.004956172839506173,
+    "busy_hour_qos_violation": 0.013737037037037035,
+    "outage": 0.027508230452674896,
+    "served_over_offered": 0.9690235695949876,
+    "mean_wake_latency_ms": 0.30287682786924086,
+    "ue_tput_p5_mbps": 0.0523152665764621,
+    "mean_reward": -0.41867249038381843
+  }
+}
