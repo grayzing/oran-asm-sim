@@ -32,6 +32,7 @@ LOS comes from building geometry. Everything (area, buildings, layout, tiers, ra
   - [Using the simulator without Gymnasium](#using-the-simulator-without-gymnasium)
   - [Defining your own observation and reward](#defining-your-own-observation-and-reward)
   - [Training with RLlib](#training-with-rllib)
+  - [Graph VDN with observation sharing](#graph-vdn-with-observation-sharing)
   - [Metrics reference](#metrics-reference)
 - [Model details](#model-details)
 - [Presets and speed](#presets-and-speed)
@@ -335,12 +336,62 @@ cfg = (PPOConfig()
 algo = cfg.build_algo()
 ```
 
-`oran_asm_sim.register()` registers the environments as `"ORanASM-v0"` for `gym.make`, and as `"oran_asm"` / `"oran_asm_ma"` for RLlib's string registry.
+`oran_asm_sim.register()` registers the environments as `"ORanASM-v0"` for `gym.make`, and as `"oran_asm"` / `"oran_asm_ma"` / `"oran_asm_graph"` for RLlib's string registry.
 
 **Simulation cost and resolution:**
 
 - The cost of a step scales with the number of backlogged UEs. Busy hours are about twice as slow as night hours.
 - Keep `decision_interval_s / n_mini` at or below about 0.1 to 0.2 s. The queueing-delay QoS measure is not meaningful with multi-second mini-periods.
+
+### Graph VDN with observation sharing
+
+`ORanASMGraphEnv` (`oran_asm_sim/graph_env.py`) is a per-O-RU environment for value-decomposition training with message passing between neighbouring O-RUs. The trainer lives in `oran_asm_sim/vdn/` and the script is `examples/train_gnn_vdn.py`.
+
+**Local observation of O-RU i:** `O_i = [Φ(i) | {Λ(x_j, s_ij, γ_ij) : j ∈ H_i} | U_ThptLim(i) | state(i)]`
+
+- `Φ(i)` is the energy efficiency of the whole O-RU: its aggregate DL throughput divided by the power of its sectors (bits/J, log scale).
+- `H_i` is the set of UEs associated with the O-RU. It includes the UEs served by its sectors, and, for a sector that is not on air, the UEs that would pick it as best server. Each UE contributes one row: estimated DL buffer `x_j` (log scale, where 1.0 is 1 Gb), CQI `s_ij` (TS 38.214 SINR thresholds, divided by 15), throughput `γ_ij`, and a one-hot of the sector it belongs to. The env returns the padded set (the top `max_ues` UEs by buffer) and a mask. The Q-network sums a learned per-UE embedding over the set (a DeepSet).
+- `U_ThptLim(i)` is the per-sector utilisation (busy fraction), which shows how close each sector is to its throughput limit. Set `thpt_lim_feature=False` to drop it.
+- `state(i)` is the per-sector cell state and command in force, plus `|H_i| / max_ues`. Set `oru_state_features=False` to drop it.
+
+**Sharing and latency.** Every O-RU broadcasts its local observation to its one-hop neighbours, which are the `max_neighbors` nearest O-RU sites, optionally limited to those within `neighbor_radius_m`. A broadcast takes `share_latency_s` (default 0.04) to arrive. An O-RU therefore acts on its own fresh observation and on its neighbours' observations as they were `share_latency_s` earlier.
+
+The simulator resolves each decision step into `n_mini` scheduling mini-periods, so latency is modelled at that resolution:
+
+- The latency is rounded up to `n = d·n_mini + m` mini-periods.
+- The shared observation is snapshotted `m` mini-periods before the end of the step and delivered `d` steps later.
+- With 1 s steps and the default `n_mini = 10`, 40 ms becomes 100 ms of staleness. Set `n_mini = 25` to model it exactly.
+- `env.share_staleness_s` reports the modelled value.
+
+**Q-network** (`GraphDRQNModule`, with parameters shared by all O-RUs):
+
+```
+h_i = ρ([Σ_{j∈H_i} λ(UE row j) | O-RU features])             DeepSet
+m_i = max_{k∈N(i)} ψ([h_i | h̃_k])                            one GNN layer, max-pooled; h̃_k from k's stale observation
+Q_i = Σ_sectors dueling-head(LSTM(ReLU(Lin([h_i | m_i]))))   recurrent, one head per sector
+```
+
+**Ablations:**
+
+| Variant (`--variant`) | Sharing / message passing | Mixer |
+|---|---|---|
+| `gnn_vdn` | yes | VDN: TD error on `Q_tot = Σ_i Q_i` and the team reward |
+| `vdn_nomp` | no (`obs_sharing=False`, `graph(message_passing=False)`) | VDN |
+| `gnn_iql` | yes | none: independent Q-learning, one TD error per O-RU (`training(mixer="none")`) |
+| `iql_nomp` | no | none |
+
+```python
+from oran_asm_sim import ORanASMGraphEnv
+from oran_asm_sim.vdn import VDNConfig
+
+cfg = (VDNConfig()
+       .environment(ORanASMGraphEnv, env_config={**env_config, "share_latency_s": 0.04})
+       .training(mixer="vdn", replay_buffer_config={"storage_dtype": "float16"})
+       .graph())                      # reads the observation layout from the env
+algo = cfg.build_algo()
+```
+
+The joint replay buffer stores only each O-RU's own and shared observation per step. It rebuilds the neighbour blocks from the static neighbour index, so memory is about `capacity × n_oru × 2 × local_dim` values.
 
 ### Metrics reference
 
@@ -505,6 +556,8 @@ oran_asm_sim/
   config.py        configuration dataclasses, PRESETS, preset()
   simulator.py     ORANSystemSimulator: the simulation engine (no RL dependencies)
   env.py           ORanASMEnv (single agent) and ORanASMMultiAgentEnv (one agent per O-RU, 3 sectors each)
+  graph_env.py     ORanASMGraphEnv: UE-set observations shared with neighbouring O-RUs (with latency)
+  vdn/             VDN / IQL with a recurrent Q-network (DRQN), incl. the DeepSet + GNN variant
   baselines.py     AlwaysOn, FixedASM, LoadThresholdSM4, run_policy
   geometry.py      study area, building import and rasterisation, deployment
   placement.py     viewsheds and iterative max-visibility site placement
@@ -514,7 +567,7 @@ oran_asm_sim/
   mobility.py      time-variant community mobility
   power.py         O-RU power model and ASM timing
   viz.py           plot_network() for maps
-examples/          baseline study, PPO training, geometry plots
+examples/          baseline study, PPO / VDN / graph-VDN training, geometry plots
 tools/             OSM building downloader
 tests/             pytest suite
 results/           baseline outputs and figures

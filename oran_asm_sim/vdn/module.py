@@ -65,8 +65,12 @@ class DRQNModule(TorchRLModule, InferenceOnlyAPI, TargetNetworkAPI, QNetAPI):
         mc = self.model_config
         self.double_q = mc["double_q"]
         self.epsilon = Scheduler(fixed_value_or_schedule=mc["epsilon"], framework="torch")
-        self.net = RecurrentQNet(self.observation_space.shape[0], n_heads, n_actions,
-                                 mc["fc_dim"], mc["rnn_dim"], mc["dueling"])
+        self.net = self._make_net(n_heads, n_actions)
+
+    def _make_net(self, n_heads: int, n_actions: int) -> nn.Module:
+        mc = self.model_config
+        return RecurrentQNet(self.observation_space.shape[0], n_heads, n_actions,
+                             mc["fc_dim"], mc["rnn_dim"], mc["dueling"])
 
     # -------------------------------------------------------------- acting
     def get_initial_state(self) -> State:
