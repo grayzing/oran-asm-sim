@@ -58,7 +58,7 @@ class GeometryConfig:
     viewshed_radius_m: float = 800.0
     min_gain_frac: float = 0.005   # 0 (and large max_sites) -> strict "until no further improvement"
     coverage_target: float = 0.97
-    max_sites: int = 45
+    max_sites: int = 90
     optimize_azimuth: bool = True
     placement_seed: int = 0
     tilt_ground_m: Optional[float] = 250.0  # per-site downtilt aims here; None -> radio.downtilt_deg

@@ -78,6 +78,11 @@ class ORANSystemSimulator:
         self.slots_per_mini = np.array([self.dt_mini / t.radio.slot_s * t.radio.tdd_dl_fraction
                                         for t in self.tiers])[st]                    # [S]
         self.p_ref_total = float(self.power.p_full.sum()) + self.dep.n_sites * self.cfg.power.site_overhead_w
+        # Callables hook(sim, i_mini, acc), run at the end of every scheduling mini-period (also during
+        # warm-up). ``acc`` holds the step's running accumulators (energy, served, served_sec, busy, ...)
+        # over the (i_mini + 1) * dt_mini seconds elapsed so far. Used e.g. to snapshot observations
+        # inside a decision step (observation-sharing latency, see graph_env.py).
+        self.mini_hooks = []
         self.reset(seed)
 
     # ------------------------------------------------------------------ #
@@ -105,6 +110,7 @@ class ORANSystemSimulator:
         self.t_last_ho = np.full(U, -np.inf)
         self.ue_handovers = np.zeros(U, int)        # cumulative per-UE HO count (reset after warm-up)
         self.state = np.full(S, ON)
+        self.last_actions = np.zeros(S, int)        # commands in force (always-on sectors: 0)
         self.timer = np.zeros(S)
         self.asm_level = np.zeros(S, int)
         self.util = np.zeros(S)
@@ -133,6 +139,7 @@ class ORANSystemSimulator:
         a = np.asarray(actions, int).reshape(-1)
         assert a.shape[0] == self.S, f"expected {self.S} actions, got {a.shape[0]}"
         a = np.where(self.controllable, a, 0)          # always-on tiers (macro) ignore commands
+        self.last_actions = a.copy()
         td4, _, ta4 = ASM_TIMING[4]
         prev = self.state.copy()
         off_cmd = a == 4
@@ -383,6 +390,8 @@ class ORANSystemSimulator:
             acc["qos"] += viol.mean()
             acc["outage"] += (~cov).mean()
             self.t += dt
+            for hook in self.mini_hooks:
+                hook(self, i_mini, acc)
 
         n = cfg.env.n_mini
         T = cfg.env.decision_interval_s

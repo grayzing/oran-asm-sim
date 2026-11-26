@@ -3,6 +3,8 @@ rooftop base-station sites and a UE snapshot from the simulator.
 
     python examples/plot_3d_geometry.py --buildings data/dtla_buildings.geojson --out results
     python examples/plot_3d_geometry.py --hour 18 --extent -800 800 -600 600 --zexag 1.5
+    python examples/plot_3d_geometry.py --buildings data/ucr_buildings.geojson \
+        --bbox 33.970067 -117.331924 33.975550 -117.323470
     python examples/plot_3d_geometry.py --synthetic            # preview without OSM data
 
 Buildings are extruded from the exact GeoJSON footprints (same height parsing as
@@ -143,6 +145,9 @@ def occluded(pts, raster, view_az, view_el, zexag, step=2.5):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--buildings", default="data/dtla_buildings.geojson", help="OSM GeoJSON (tools/fetch_osm_buildings.py)")
+    ap.add_argument("--bbox", nargs=4, type=float, metavar=("S", "W", "N", "E"),
+                    help="study area in degrees (default: the preset's bbox, Downtown LA); must match "
+                         "the area the --buildings file was fetched for")
     ap.add_argument("--synthetic", action="store_true", help="use the synthetic city instead (preview only)")
     ap.add_argument("--preset", default="dtla_full")
     ap.add_argument("--out", default="results")
@@ -175,6 +180,8 @@ def main():
             sys.exit(f"{a.buildings} not found. Run tools/fetch_osm_buildings.py first, or pass --synthetic "
                      "for a preview with the synthetic city.")
         geo_over["buildings_geojson"] = a.buildings
+    if a.bbox:
+        geo_over["bbox"] = tuple(a.bbox)
     cfg = preset(a.preset, geometry=geo_over, env={"seed": a.seed, "warmup_s": 0.0})
     with warnings.catch_warnings():
         warnings.simplefilter("ignore" if a.synthetic else "default")
