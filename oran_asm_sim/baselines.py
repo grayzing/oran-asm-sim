@@ -1,5 +1,6 @@
-"""Reference (non-learning) policies. Each maps the env to a per-sector command
-vector in {0..4}; useful as RL baselines and sanity checks."""
+"""Reference (non-learning) policies. Each maps the env to a command vector in
+{0..4} for the controllable sectors (``env.ctrl``; the HetNet macro is always on);
+useful as RL baselines and sanity checks."""
 from __future__ import annotations
 
 import numpy as np
@@ -33,9 +34,10 @@ class LoadThresholdSM4:
 
     def __call__(self, env, obs=None):
         sim = env.sim
-        pot = np.bincount(sim.best_sector_if_all_on(), minlength=env.S)
+        best = sim.best_sector_if_all_on()
+        pot = np.bincount(best, minlength=sim.S)[env.ctrl]
         lam = sim.traffic.mean_offered_bps(sim.t, sim.period_multiplier())
-        pot_load = np.bincount(sim.best_sector_if_all_on(), weights=lam, minlength=env.S)
+        pot_load = np.bincount(best, weights=lam, minlength=sim.S)[env.ctrl]
         off = (pot <= self.k) & (pot_load < self.thr)
         return np.where(off, 4, self.lvl).astype(int)
 

@@ -17,17 +17,22 @@ def plot_network(sim, ax, show_ues=True, show_pois=True, title=None, cmd=None):
         ext = [b.origin[0], b.origin[0] + b.shape[1] * b.res, b.origin[1], b.origin[1] + b.shape[0] * b.res]
         ax.imshow(np.ma.masked_equal(b.h, 0), origin="lower", extent=ext, cmap="Greys", alpha=0.45,
                   vmin=0, vmax=150, interpolation="nearest")
-    r = min(sim.cfg.geometry.isd_m / 3.0, 110.0)
+    r0 = min(sim.cfg.geometry.isd_m / 3.0, 110.0)
+    macro = ~getattr(sim, "controllable", np.ones(dep.n_sectors, bool))   # always-on (HetNet macro) sectors
     for s in range(dep.n_sectors):
         x, y = dep.sector_xy[s]
+        r = 2.5 * r0 if macro[s] else r0
         az = np.radians(dep.sector_az_deg[s])
         if cmd is not None:
             c = LEVEL_COLORS[int(cmd[s])]
         else:
             c = STATE_COLORS[int(sim.state[s])] if sim.state[s] != 0 else LEVEL_COLORS[int(sim.asm_level[s])]
-        w = mpatches.Wedge((x, y), r, np.degrees(az) - 55, np.degrees(az) + 55, fc=c, ec="white", lw=0.5, alpha=0.85)
+        w = mpatches.Wedge((x, y), r, np.degrees(az) - 55, np.degrees(az) + 55, fc=c, ec="white", lw=0.5,
+                           alpha=0.35 if macro[s] else 0.85, zorder=1 if macro[s] else 2)
         ax.add_patch(w)
     ax.plot(*dep.site_xy.T, "k^", ms=4)
+    if macro.any():
+        ax.plot(*dep.site_xy[np.unique(dep.sector_site[macro])].T, "k*", ms=14, mfc="#ffd166", label="macro")
     if show_ues:
         ue = sim.mob.xy
         cov = sim.serving >= 0

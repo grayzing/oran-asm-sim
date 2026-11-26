@@ -28,4 +28,4 @@ class DRQNPolicy:
         out = self.module.compute_q_values({Columns.OBS: x, Columns.STATE_IN: self.state})
         self.state = out[Columns.STATE_OUT]
         act = out[QF_PREDS][:, 0].argmax(-1).numpy()                                        # [n_oru, H]
-        return env.action_levels[self.ma_env.sector_actions(act)]
+        return env.action_levels[self.ma_env.sector_actions(act)[env.ctrl]]

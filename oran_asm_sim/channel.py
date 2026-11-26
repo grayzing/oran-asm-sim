@@ -129,18 +129,33 @@ def sinr_to_eff(sinr_db, table="64QAM"):
 # --------------------------------------------------------------------------- #
 class LargeScaleChannel:
     """Per (UE, site) LOS state and shadow fading with AR(1) spatial correlation
-    (Gudmundson); per (UE, sector) antenna gains. Produces received power per PRB."""
+    (Gudmundson); per (UE, sector) antenna gains. Produces received power per PRB.
 
-    def __init__(self, dep, radio: RadioConfig, n_ue: int, rng: np.random.Generator):
-        self.dep, self.radio, self.rng = dep, radio, rng
+    Multi-tier: every site belongs to a tier (``dep.site_tier``) with its own
+    :class:`RadioConfig` (carrier, scenario, antenna, power, numerology), so path
+    loss, antenna gain, transmit PSD and noise per PRB are evaluated per tier."""
+
+    def __init__(self, dep, radio, n_ue: int, rng: np.random.Generator):
+        self.dep, self.rng = dep, rng
+        self.radios = list(radio) if isinstance(radio, (list, tuple)) else [radio]
+        self.radio = self.radios[0]                     # shared UE-side / LOS-model parameters
         self.n_ue = n_ue
         n_site = dep.n_sites
+        self.site_tier = np.asarray(dep.site_tier, int)
+        self.sector_tier = self.site_tier[dep.sector_site]
         self.z_los = rng.standard_normal((n_ue, n_site))
         self.z_sf = rng.standard_normal((n_ue, n_site))
         self.prev_xy = None
-        p_tot_dbm = 10 * np.log10(radio.tx_power_per_chain_w * radio.n_tx_chains * 1e3)
-        self.p_tx_prb_dbm = p_tot_dbm - 10 * np.log10(radio.n_prb)
-        self.noise_prb_w = db2lin(-174 + 10 * np.log10(12 * radio.scs_khz * 1e3) + radio.ue_nf_db) * 1e-3
+        rt = self.radios
+        p_tot_dbm = np.array([10 * np.log10(r.tx_power_per_chain_w * r.n_tx_chains * 1e3) for r in rt])
+        p_prb = p_tot_dbm - 10 * np.log10([r.n_prb for r in rt])
+        noise = np.array([db2lin(-174 + 10 * np.log10(12 * r.scs_khz * 1e3) + r.ue_nf_db) * 1e-3 for r in rt])
+        self.p_tx_prb_dbm = p_prb[self.sector_tier]                     # [S]
+        self.noise_prb_w = noise[self.sector_tier]                      # [S]
+        self.ue_gain_db = np.array([r.ue_gain_dbi for r in rt])[self.sector_tier]
+        self.min_d = np.array([r.min_dist_2d_m for r in rt])[self.site_tier]
+        self.sf_dc_los = np.array([r.sf_corr_dist_los_m for r in rt])[self.site_tier]
+        self.sf_dc_nlos = np.array([r.sf_corr_dist_nlos_m for r in rt])[self.site_tier]
         self.los = np.zeros((n_ue, n_site), bool)
 
     def reset_ue(self, idx):
@@ -149,10 +164,11 @@ class LargeScaleChannel:
         self.z_sf[idx] = self.rng.standard_normal((len(idx), self.z_sf.shape[1]))
 
     def update(self, ue_xy: np.ndarray, extra_loss_db: np.ndarray) -> np.ndarray:
-        """Returns received power per PRB [U, n_sectors] in W (no fast fading)."""
+        """Returns received power per PRB [U, n_sectors] in W (no fast fading).
+        ``extra_loss_db``: [U] (all tiers) or [U, n_tiers] (frequency-dependent O2I)."""
         r, dep = self.radio, self.dep
         d = dep.site_xy[None, :, :] - ue_xy[:, None, :]                  # UE -> site
-        d2d = np.maximum(np.hypot(d[..., 0], d[..., 1]), r.min_dist_2d_m)
+        d2d = np.maximum(np.hypot(d[..., 0], d[..., 1]), self.min_d[None, :])
 
         # --- spatially-correlated latents (AR(1) in travelled distance)
         if self.prev_xy is not None:
@@ -160,36 +176,48 @@ class LargeScaleChannel:
             # torus wrap shows up as a huge jump: decorrelate fully (that is physical)
             rho_los = np.exp(-step / r.los_corr_dist_m)[:, None]
             self.z_los = rho_los * self.z_los + np.sqrt(1 - rho_los ** 2) * self.rng.standard_normal(self.z_los.shape)
-            dc = np.where(self.los, r.sf_corr_dist_los_m, r.sf_corr_dist_nlos_m)
+            dc = np.where(self.los, self.sf_dc_los[None, :], self.sf_dc_nlos[None, :])
             rho_sf = np.exp(-step[:, None] / dc)
             self.z_sf = rho_sf * self.z_sf + np.sqrt(1 - rho_sf ** 2) * self.rng.standard_normal(self.z_sf.shape)
         self.prev_xy = ue_xy.copy()
 
-        h_bs = dep.site_h[None, :] if dep.site_h is not None else r.h_bs_m
-        if r.los_model == "geometry" and dep.site_vis is not None:
+        hb = dep.site_h if dep.site_h is not None else np.array([self.radios[t].h_bs_m for t in self.site_tier])
+        geo_los = r.los_model == "geometry" and dep.site_vis is not None
+        if geo_los:
             # deterministic LOS from the cached per-site viewsheds of the imported buildings;
             # indoor UEs take the LOS state of their nearest outdoor cell (facade)
             idx = dep.buildings.outdoor_flat_index(ue_xy)
             self.los = dep.site_vis[:, idx].T
-        else:
-            self.los = _ndtr(self.z_los) < los_probability_38901(r.scenario, d2d, r.h_ut_m)
-
-        pl_l, pl_n, s_l, s_n = pathloss_38901(r.scenario, d2d, h_bs, r.h_ut_m, r.fc_ghz)
-        pl = np.where(self.los, pl_l, pl_n)
-        if r.shadowing:
-            pl = pl + np.where(self.los, s_l, s_n) * self.z_sf
+        pl = np.empty_like(d2d)
+        for t, rt in enumerate(self.radios):
+            m = self.site_tier == t
+            if not m.any():
+                continue
+            if not geo_los:
+                self.los[:, m] = _ndtr(self.z_los[:, m]) < los_probability_38901(rt.scenario, d2d[:, m], rt.h_ut_m)
+            pl_l, pl_n, s_l, s_n = pathloss_38901(rt.scenario, d2d[:, m], hb[None, m], rt.h_ut_m, rt.fc_ghz)
+            lo = self.los[:, m]
+            pl[:, m] = np.where(lo, pl_l, pl_n)
+            if r.shadowing:
+                pl[:, m] += np.where(lo, s_l, s_n) * self.z_sf[:, m]
         self.d2d_site = d2d
 
         # --- per-sector antenna gain
         ss = dep.sector_site
         bearing = np.degrees(np.arctan2(-d[..., 1], -d[..., 0]))          # site -> UE
         phi = (bearing[:, ss] - dep.sector_az_deg[None, :] + 180.0) % 360.0 - 180.0
-        hb = dep.site_h if dep.site_h is not None else np.full(dep.n_sites, r.h_bs_m)
         theta = 90.0 + np.degrees(np.arctan2(hb[None, :] - r.h_ut_m, d2d))[:, ss]
         tilt = dep.site_tilt_deg[ss][None, :] if dep.site_tilt_deg is not None else None
-        g = sector_antenna_gain_db(r, phi, theta, tilt)
+        g = np.empty_like(phi)
+        for t, rt in enumerate(self.radios):
+            m = self.sector_tier == t
+            if m.any():
+                g[:, m] = sector_antenna_gain_db(rt, phi[:, m], theta[:, m],
+                                                 None if tilt is None else tilt[:, m])
 
-        rx_dbm = self.p_tx_prb_dbm + g + r.ue_gain_dbi - pl[:, ss] - extra_loss_db[:, None]
+        extra = np.asarray(extra_loss_db, float)
+        extra = extra[:, self.sector_tier] if extra.ndim == 2 else extra[:, None]
+        rx_dbm = self.p_tx_prb_dbm[None, :] + g + self.ue_gain_db[None, :] - pl[:, ss] - extra
         self.los_sector = self.los[:, ss]
         return db2lin(rx_dbm) * 1e-3
 
@@ -227,12 +255,14 @@ def mimo_eigs(h):
     return np.linalg.eigvalsh(g)[..., ::-1].clip(min=0)
 
 
-def link_rates(rho, eigs, radio: RadioConfig, n_prb_rbg):
+def link_rates(rho, eigs, radio: RadioConfig, n_prb_rbg, overhead=None):
     """rho: [U,B] SNR-per-Rx-antenna (P_rx/(I+N)); eigs [U,B,L].
+    n_prb_rbg: [B] or per-UE [U,B] PRBs per RBG; overhead: None (radio.overhead) or [U].
 
     Returns (bits per slot [U,B], rank [U], mod_bits [U,B], wideband SINR dB [U]).
     Rank is chosen per UE (wideband RI) to maximise mean rate over RBGs."""
-    re_per_prb = 12 * 14 * (1 - radio.overhead)
+    ovh = radio.overhead if overhead is None else np.asarray(overhead, float)[:, None]
+    re_per_prb = 12 * 14 * (1 - ovh)
     lmax = min(radio.max_layers, eigs.shape[-1])
     best = None
     for r_ in range(1, lmax + 1):
@@ -248,5 +278,8 @@ def link_rates(rho, eigs, radio: RadioConfig, n_prb_rbg):
             best[1] = np.where(m[:, None], tot, best[1])
             best[2] = np.where(m, r_, best[2])
             best[3] = np.where(m[:, None], mod.max(-1), best[3])
-    bits = best[1] * (1 - radio.bler_target) * re_per_prb * n_prb_rbg[None, :]
+    n_prb_rbg = np.asarray(n_prb_rbg, float)
+    if n_prb_rbg.ndim == 1:
+        n_prb_rbg = n_prb_rbg[None, :]
+    bits = best[1] * (1 - radio.bler_target) * re_per_prb * n_prb_rbg
     return bits, best[2], best[3]

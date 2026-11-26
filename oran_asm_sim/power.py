@@ -124,12 +124,19 @@ class ORUPowerModel:
         self.p_max_chain = radio.tx_power_per_chain_w
         self.n_chain = radio.n_tx_chains
 
-        # pre-computed sleep powers (Table VII convention: still-on components at reference load)
+        # pre-computed sleep powers. Still-on components at reference load (Table VII convention)
+        # or at the active-idle operating point (cfg.sleep_component_load == "idle")
+        if cfg.sleep_component_load == "idle":
+            comp_on = self._components(np.full(1, cfg.signalling_load))[0]
+        elif cfg.sleep_component_load == "reference":
+            comp_on = self.base
+        else:
+            raise ValueError(f"unknown sleep_component_load {cfg.sleep_component_load!r}")
         self.sleep_power = {}
         self.sleep_breakdown = {}
         for k in (1, 2, 3, 4):
             on = (self.off_from == 0) | (self.off_from > k)
-            p = self.base * on
+            p = comp_on * on
             if k == 4:
                 p = p * np.where(self.unit == "RF", SM4_RETENTION["RF"], SM4_RETENTION["DU"])
             self.sleep_breakdown[k] = (float(p[self.unit == "RF"].sum()), float(p[self.unit == "DU"].sum()))
@@ -147,8 +154,8 @@ class ORUPowerModel:
         dyn = self.p_max_chain * load ** (1.0 - c.pa_gamma) / c.pa_eta_max
         return self.n_chain * (c.pa_quiescent_w + np.where(pt > 0, dyn, 0.0))
 
-    def active(self, load, streams=None, mod_bits=None) -> PowerBreakdown:
-        """Active-state power for PRB load in [0,1], vectorised over sectors."""
+    def _components(self, load, streams=None, mod_bits=None) -> np.ndarray:
+        """Per-component power (excl. PA) [N, C] at PRB load in [0,1]."""
         c = self.cfg
         load = np.clip(np.asarray(load, float), 0.0, 1.0)
         if streams is None:
@@ -159,7 +166,12 @@ class ORUPowerModel:
         md = np.maximum(np.asarray(mod_bits, float), 2.0) / c.ref_mod_bits
         lf = np.where(self.e_load[None, :] > 0,
                       c.static_share + (1 - c.static_share) * load[:, None] ** self.e_load[None, :], 1.0)
-        comp = self.base[None, :] * lf * st[:, None] ** self.e_str[None, :] * md[:, None] ** self.e_mod[None, :]
+        return self.base[None, :] * lf * st[:, None] ** self.e_str[None, :] * md[:, None] ** self.e_mod[None, :]
+
+    def active(self, load, streams=None, mod_bits=None) -> PowerBreakdown:
+        """Active-state power for PRB load in [0,1], vectorised over sectors."""
+        load = np.clip(np.asarray(load, float), 0.0, 1.0)
+        comp = self._components(load, streams, mod_bits)
         rf = comp[:, self.unit == "RF"].sum(1)
         du = comp[:, self.unit == "DU"].sum(1)
         pa = self.pa_power(load)
@@ -178,3 +190,29 @@ class ORUPowerModel:
     def component_table(self, load=1.0):
         lf = np.where(self.e_load > 0, self.cfg.static_share + (1 - self.cfg.static_share) * load ** self.e_load, 1)
         return {n: float(p) for n, p in zip(self.names, self.base * lf)}
+
+
+class SectorPowerModel:
+    """Per-sector view over one :class:`ORUPowerModel` per tier (HetNet: the macro and
+    the mmWave O-RUs differ in bandwidth, TX chains and PA output power). Exposes
+    ``p_full`` / ``p_idle`` / ``sleep_power[k]`` as [S] arrays and a vectorised
+    :meth:`active` that evaluates each sector with its tier's model."""
+
+    def __init__(self, models, sector_tier):
+        self.models = list(models)
+        self.sector_tier = np.asarray(sector_tier, int)
+        st = self.sector_tier
+        self.p_full = np.array([m.p_full for m in self.models])[st]
+        self.p_idle = np.array([m.p_idle for m in self.models])[st]
+        self.sleep_power = {k: np.array([m.sleep_power[k] for m in self.models])[st] for k in (1, 2, 3, 4)}
+
+    def active(self, load, streams=None, mod_bits=None) -> np.ndarray:
+        """Total active-state power [S] (each sector with its own tier model)."""
+        load = np.asarray(load, float)
+        out = np.zeros(load.shape)
+        for t, m in enumerate(self.models):
+            sel = self.sector_tier == t
+            if sel.any():
+                out[sel] = m.active(load[sel], None if streams is None else np.asarray(streams)[sel],
+                                    None if mod_bits is None else np.asarray(mod_bits)[sel]).total
+        return out

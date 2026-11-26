@@ -1,10 +1,14 @@
 """Gymnasium environments for per-sector O-RU ASM control.
 
 * :class:`ORanASMEnv` - single-agent (centralised rApp/xApp view). Observation
-  is a flat ``Box`` (or ``Dict``), action is ``MultiDiscrete([5] * n_sectors)``.
+  is a flat ``Box`` (or ``Dict``), action is ``MultiDiscrete([5] * n_ctrl)``.
 * :class:`ORanASMMultiAgentEnv` - RLlib ``MultiAgentEnv`` with one agent per
-  O-RU (one per site), each controlling the sleep commands of its 3 sectors with
-  a ``MultiDiscrete([5] * 3)`` action.
+  controllable O-RU (one per site), each controlling the sleep commands of its 3
+  sectors with a ``MultiDiscrete([5] * 3)`` action.
+
+In the default HetNet topology the always-on macro O-RU is not an agent: only the
+mmWave sectors (``sim.ctrl``) appear in the action space and in the per-sector
+observation; the macro's load is summarised in the global features.
 
 Both accept an RLlib-style ``env_config`` dict, see :meth:`SimConfig.from_dict`.
 """
@@ -23,7 +27,7 @@ SECTOR_FEATURES = (
     "util", "n_ue", "backlog", "offered", "served", "power", "sinr", "sleep_frac",
     "pot_demand", "cmd0", "cmd1", "cmd2", "cmd3", "cmd4", "st_on", "st_deact", "st_sm4", "st_act",
 )
-GLOBAL_FEATURES = ("hour_sin", "hour_cos", "outage", "qos")
+GLOBAL_FEATURES = ("hour_sin", "hour_cos", "outage", "qos", "macro_util", "macro_ue_frac")
 CAP_REF_BPS = 500e6
 
 
@@ -51,7 +55,8 @@ class ORanASMEnv(Env):
         self._seed = seed
         self.render_mode = render_mode
         self.sim = ORANSystemSimulator(self.cfg, seed=seed)
-        self.S = self.sim.S
+        self.ctrl = self.sim.ctrl                    # controllable sector indices (into sim.S)
+        self.S = len(self.ctrl)                      # action dimension
         self.action_levels = np.asarray(self.cfg.env.action_set, int)
         self.action_space = spaces.MultiDiscrete([len(self.action_levels)] * self.S)
         F, Gf = len(SECTOR_FEATURES), len(GLOBAL_FEATURES)
@@ -61,33 +66,43 @@ class ORanASMEnv(Env):
                 "global": spaces.Box(-1.0, 1.0, (Gf,), np.float32)})
         else:
             self.observation_space = spaces.Box(-1.0, 2.0, (self.S * F + Gf,), np.float32)
-        self._last_cmd = np.zeros(self.S, int)
+        self._last_cmd = np.zeros(self.sim.S, int)   # last command per sector (all sectors; macro = 0)
 
     # ------------------------------------------------------------------ #
     def sector_features(self) -> np.ndarray:
+        """Features of the controllable sectors, [n_ctrl, F]."""
         sim, m = self.sim, self.sim.last
-        S = self.S
-        f = np.zeros((S, len(SECTOR_FEATURES)), np.float32)
-        ups = max(sim.U / S, 1.0)
-        f[:, 0] = m.get("util_sector", np.zeros(S))
-        f[:, 1] = np.clip(m.get("n_ue_sector", np.zeros(S)) / (2 * ups), 0, 2)
-        f[:, 2] = np.log10(1 + sim.sector_backlog()) / 9.0
-        f[:, 3] = np.clip(sim.sector_offered_bps() / CAP_REF_BPS, 0, 2)
-        f[:, 4] = np.clip(m.get("served_sector_bps", np.zeros(S)) / CAP_REF_BPS, 0, 2)
-        f[:, 5] = m.get("power_sector_w", np.zeros(S)) / sim.power.p_full
-        f[:, 6] = np.clip(sim.sector_mean_sinr_db() / 30.0, -1, 2)
-        f[:, 7] = m.get("sleep_frac_sector", np.zeros(S))
-        pot = np.bincount(sim.best_sector_if_all_on(), minlength=S)
+        Sa, c = sim.S, self.ctrl
+        f = np.zeros((self.S, len(SECTOR_FEATURES)), np.float32)
+        ups = max(sim.U / Sa, 1.0)
+        z = np.zeros(Sa)
+        f[:, 0] = m.get("util_sector", z)[c]
+        f[:, 1] = np.clip(m.get("n_ue_sector", z)[c] / (2 * ups), 0, 2)
+        f[:, 2] = np.log10(1 + sim.sector_backlog()[c]) / 9.0
+        f[:, 3] = np.clip(sim.sector_offered_bps()[c] / CAP_REF_BPS, 0, 2)
+        f[:, 4] = np.clip(m.get("served_sector_bps", z)[c] / CAP_REF_BPS, 0, 2)
+        f[:, 5] = m.get("power_sector_w", z)[c] / sim.power.p_full[c]
+        f[:, 6] = np.clip(sim.sector_mean_sinr_db()[c] / 30.0, -1, 2)
+        f[:, 7] = m.get("sleep_frac_sector", z)[c]
+        pot = np.bincount(sim.best_sector_if_all_on(), minlength=Sa)[c]
         f[:, 8] = np.clip(pot / (2 * ups), 0, 2)
-        f[np.arange(S), 9 + np.clip(self._last_cmd, 0, 4)] = 1.0
-        f[np.arange(S), 14 + sim.state] = 1.0
+        ar = np.arange(self.S)
+        f[ar, 9 + np.clip(self._last_cmd[c], 0, 4)] = 1.0
+        f[ar, 14 + sim.state[c]] = 1.0
         return f
 
     def global_features(self) -> np.ndarray:
-        h = (self.sim.t / 3600.0) % 24.0
-        m = self.sim.last
+        sim = self.sim
+        h = (sim.t / 3600.0) % 24.0
+        m = sim.last
+        fixed = ~sim.controllable                     # always-on (macro) sectors
+        util = m.get("util_sector")
+        n_ue = m.get("n_ue_sector")
+        macro_util = float(util[fixed].mean()) if fixed.any() and util is not None else 0.0
+        macro_ue = float(n_ue[fixed].sum() / max(sim.U, 1)) if fixed.any() and n_ue is not None else 0.0
         return np.array([np.sin(2 * np.pi * h / 24), np.cos(2 * np.pi * h / 24),
-                         m.get("outage_frac", 0.0), m.get("qos_violation_frac", 0.0)], np.float32)
+                         m.get("outage_frac", 0.0), m.get("qos_violation_frac", 0.0),
+                         macro_util, macro_ue], np.float32)
 
     def _obs(self):
         sf, gf = self.sector_features(), self.global_features()
@@ -108,12 +123,14 @@ class ORanASMEnv(Env):
             self._seed += 7919          # new but reproducible episode
         start = (options or {}).get("start_hour")
         self.sim.reset(self._seed, start)
-        self._last_cmd = np.zeros(self.S, int)
+        self._last_cmd = np.zeros(self.sim.S, int)
         return self._obs(), self._info(self.sim.last)
 
     def step(self, action):
         a = np.asarray(action, int).reshape(-1)
-        cmd = self.action_levels[a]
+        assert a.shape[0] == self.S, f"expected {self.S} actions (controllable sectors), got {a.shape[0]}"
+        cmd = np.zeros(self.sim.S, int)
+        cmd[self.ctrl] = self.action_levels[a]
         self._last_cmd = cmd
         m = self.sim.step(cmd)
         r = self.reward(m)
@@ -122,7 +139,7 @@ class ORanASMEnv(Env):
 
     @staticmethod
     def _info(m):
-        keys = ("time_s", "hour", "period", "power_total_w", "power_norm", "energy_j", "offered_bps",
+        keys = ("time_s", "hour", "period", "power_total_w", "power_fixed_w", "power_ctrl_w", "power_norm", "energy_j", "offered_bps",
                 "served_bps", "drop_frac", "blocked_frac", "outage_frac", "qos_violation_frac", "handovers",
                 "ho_mobility", "ho_forced", "ho_intra_site", "ho_inter_site", "ho_pingpong",
                 "ho_pingpong_frac", "rlf", "reconnects", "ho_rate_per_ue_s",
@@ -149,8 +166,9 @@ STATE_EXTRAS = ("st_on", "st_deact", "st_sm4", "st_act", "cmd0", "cmd1", "cmd2",
 
 
 class ORanASMMultiAgentEnv(MultiAgentEnv):
-    """One agent per O-RU. An O-RU sits on one site and controls the sleep commands
-    of that site's three sectors.
+    """One agent per controllable O-RU. An O-RU sits on one site and controls the
+    sleep commands of that site's three sectors. The always-on macro O-RU of the
+    HetNet topology is not an agent (its sectors always get command 0).
 
     Agent ``oru_i`` controls the sectors ``self.sectors_of[i]`` (in azimuth order) and
     acts with ``MultiDiscrete([L] * 3)``, one command index per sector.
@@ -190,12 +208,17 @@ class ORanASMMultiAgentEnv(MultiAgentEnv):
         sim = self.core.sim
         self.S = sim.S
         site = np.asarray(sim.dep.sector_site, int)
-        n_oru = int(site.max()) + 1
-        counts = np.bincount(site, minlength=n_oru)
+        ctrl_sec = sim.ctrl
+        self.oru_site = np.unique(site[ctrl_sec])                     # site index of each agent
+        if not np.array_equal(np.sort(ctrl_sec), np.where(np.isin(site, self.oru_site))[0]):
+            raise ValueError("an O-RU must be either fully controllable or fully always-on")
+        n_oru = len(self.oru_site)
+        counts = np.bincount(site[ctrl_sec], minlength=site.max() + 1)[self.oru_site]
         if not np.all(counts == counts[0]):
             raise ValueError(f"every O-RU must control the same number of sectors, got {counts.tolist()}")
         self.n_oru, self.sectors_per_oru = n_oru, int(counts[0])
-        self.sectors_of = np.argsort(site, kind="stable").reshape(n_oru, self.sectors_per_oru)   # [n_oru, 3]
+        order = ctrl_sec[np.argsort(site[ctrl_sec], kind="stable")]
+        self.sectors_of = order.reshape(n_oru, self.sectors_per_oru)                 # [n_oru, 3]
         self.agents = self.possible_agents = [f"oru_{i}" for i in range(n_oru)]
         K3 = self.sectors_per_oru
         n_extra = len(STATE_EXTRAS) if self.state_feats else 0
@@ -219,8 +242,9 @@ class ORanASMMultiAgentEnv(MultiAgentEnv):
         return self.action_spaces[agent_id]
 
     def sector_actions(self, actions) -> np.ndarray:
-        """Per-sector action indices [S] from per-O-RU actions: a dict keyed by agent ID
-        (missing agents act 0) or an array [n_oru, 3]."""
+        """Per-sector action indices [S] (all sectors; always-on sectors get 0) from
+        per-O-RU actions: a dict keyed by agent ID (missing agents act 0) or an array
+        [n_oru, 3]."""
         act = np.zeros(self.S, int)
         if isinstance(actions, dict):
             for i, a in enumerate(self.agents):
@@ -320,9 +344,10 @@ class ORanASMMultiAgentEnv(MultiAgentEnv):
         return self._obs(), {a: {} for a in self.agents}
 
     def step(self, action_dict):
-        _, r, term, trunc, info = self.core.step(self.sector_actions(action_dict))
+        _, r, term, trunc, info = self.core.step(self.sector_actions(action_dict)[self.core.ctrl])
         m = self.core.sim.last
-        p_own = m["power_sector_w"][self.sectors_of].sum(1) / (self.sectors_per_oru * self.core.sim.power.p_full)
+        p_full = self.core.sim.power.p_full
+        p_own = m["power_sector_w"][self.sectors_of].sum(1) / p_full[self.sectors_of].sum(1)
         w = self.core.cfg.env.w_energy
         rew = {a: float((1 - self.local_mix) * r - self.local_mix * w * p_own[i])
                for i, a in enumerate(self.agents)}

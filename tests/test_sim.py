@@ -14,6 +14,7 @@ from oran_asm_sim.scheduler import pf_schedule
 from oran_asm_sim.simulator import ORANSystemSimulator
 
 SMALL = {"geometry": {"layout": "rings", "n_rings": 1}, "env": {"warmup_s": 2, "n_mini": 5, "seed": 0}}
+HOMOG = dict(SMALL, hetnet={"enabled": False})
 
 
 # ---------------------------------------------------------------- power model
@@ -109,11 +110,22 @@ def test_pf_conservation_and_fairness():
 
 # ---------------------------------------------------------------- engine / env
 def test_sm4_all_off_gives_outage_and_low_power():
-    sim = ORANSystemSimulator(SimConfig.from_dict(SMALL), seed=1)
+    sim = ORANSystemSimulator(SimConfig.from_dict(HOMOG), seed=1)
     for _ in range(3):
         m = sim.step(np.full(sim.S, 4))
     assert m["outage_frac"] == pytest.approx(1.0)
-    assert m["power_total_w"] == pytest.approx(sim.S * sim.power.sleep_power[4], rel=1e-6)
+    assert m["power_total_w"] == pytest.approx(sim.S * sim.power.sleep_power[4][0], rel=1e-6)
+
+
+def test_hetnet_macro_ignores_sm4_and_keeps_umbrella():
+    sim = ORANSystemSimulator(SimConfig.from_dict(SMALL), seed=1)
+    macro = ~sim.controllable
+    for _ in range(3):
+        m = sim.step(np.full(sim.S, 4))                 # SM4 for everyone: only mmWave obeys
+    assert np.all(sim.state[macro] == 0) and np.all(sim.state[~macro] == 2)
+    assert m["outage_frac"] < 1.0 and m["n_ue_tier"][0] > 0 and m["n_ue_tier"][1] == 0
+    assert m["power_sector_w"][~macro] == pytest.approx(sim.power.sleep_power[4][~macro], rel=1e-6)
+    assert np.all(m["power_sector_w"][macro] >= sim.power.p_idle[macro] - 1e-6)
 
 
 def test_asm_saves_energy():
@@ -129,7 +141,7 @@ def test_sm4_wakeup_takes_activation_time():
     sim = ORANSystemSimulator(cfg, seed=1)
     sim.step(np.full(sim.S, 4))
     sim.step(np.full(sim.S, 4))
-    assert np.all(sim.state == 2)
+    assert np.all(sim.state[sim.ctrl] == 2) and np.all(sim.state[~sim.controllable] == 0)
     sim.step(np.zeros(sim.S, int))            # 0.5 s activation inside a 1 s step
     assert np.all(sim.state == 0)
 
@@ -157,10 +169,12 @@ def test_env_api_single_and_multi():
         ma = ORanASMMultiAgentEnv(dict(SMALL, ma_obs_mode=mode))
         obs, _ = ma.reset(seed=0)
         dep = ma.core.sim.dep
-        assert set(obs) == set(ma.agents) and len(ma.agents) == dep.n_sites      # one agent per O-RU
-        assert ma.sectors_of.shape == (dep.n_sites, 3)
-        assert np.array_equal(np.sort(ma.sectors_of.ravel()), np.arange(ma.S))
-        assert all((dep.sector_site[ma.sectors_of[i]] == i).all() for i in range(ma.n_oru))
+        n_mm = int((dep.site_tier == 1).sum())                                   # macros are not agents
+        assert set(obs) == set(ma.agents) and len(ma.agents) == n_mm            # one agent per mmWave O-RU
+        assert ma.sectors_of.shape == (n_mm, 3)
+        assert np.array_equal(np.sort(ma.sectors_of.ravel()), ma.core.ctrl)
+        assert all((dep.sector_site[ma.sectors_of[i]] == ma.oru_site[i]).all() for i in range(ma.n_oru))
+        assert (dep.site_tier[ma.oru_site] == 1).all()
         assert all(ma.action_spaces[a].shape == (3,) for a in ma.agents)
         obs, rew, te, tr, _ = ma.step({a: ma.action_spaces[a].sample() for a in ma.agents})
         assert "__all__" in te and all(np.isfinite(v) for v in rew.values())
@@ -297,8 +311,9 @@ def test_handover_breakdown_consistent_and_sm4_forces_ho():
         assert m["ho_pingpong"] <= m["handovers"]
     assert sim.ue_handovers.sum() == tot["handovers"]
 
-    # switch off the most loaded sector: its UEs must be handed over (forced) or dropped
-    s = int(np.argmax(np.bincount(sim.serving[sim.serving >= 0], minlength=S)))
+    # switch off the most loaded (controllable) sector: its UEs must be handed over (forced) or dropped
+    load = np.bincount(sim.serving[sim.serving >= 0], minlength=S)
+    s = int(sim.ctrl[np.argmax(load[sim.ctrl])])
     n_on_s = int(np.sum(sim.serving == s))
     assert n_on_s > 0
     a = np.zeros(S, int)
@@ -307,3 +322,74 @@ def test_handover_breakdown_consistent_and_sm4_forces_ho():
     assert m["ho_forced"] + m["rlf"] >= n_on_s
     assert m["ho_out_sector"][s] >= m["ho_forced"] > 0
     assert not np.any(sim.serving == s)
+
+
+# ---------------------------------------------------------------- HetNet topology
+def test_hetnet_topology_and_tiers():
+    cfg = SimConfig.from_dict(SMALL)
+    sim = ORANSystemSimulator(cfg, seed=0)
+    dep = sim.dep
+    assert dep.site_tier[0] == 0 and (dep.site_tier[1:] == 1).all()          # macro first, mmWave around
+    assert np.allclose(dep.site_xy[0], 0.0) and dep.n_sites == 7               # macro replaces the hex centre
+    assert np.all(np.hypot(*dep.site_xy[1:].T) > 100)
+    macro, mm = sim.tiers
+    assert (macro.radio.fc_ghz, macro.radio.bw_mhz, macro.radio.scs_khz, macro.radio.n_prb) == (6.0, 40.0, 30.0, 106)
+    assert macro.radio.slot_s == pytest.approx(0.5e-3) and not macro.controllable
+    assert 10 * np.log10(macro.radio.tx_power_per_chain_w * macro.radio.n_tx_chains * 1e3) == pytest.approx(49.0)
+    assert (mm.radio.fc_ghz, mm.radio.bw_mhz, mm.radio.scs_khz, mm.radio.n_prb) == (35.0, 100.0, 120.0, 66)
+    assert mm.radio.slot_s == pytest.approx(0.125e-3) and mm.controllable
+    assert 10 * np.log10(mm.radio.tx_power_per_chain_w * mm.radio.n_tx_chains * 1e3) == pytest.approx(35.0)
+    assert sim.prb_per_rbg[sim.sector_tier == 0].sum(1)[0] == 106
+    assert sim.prb_per_rbg[sim.sector_tier == 1].sum(1)[0] == 66
+    assert np.array_equal(sim.ctrl, np.arange(3, sim.S))
+    env = ORanASMEnv(SMALL)
+    assert env.action_space.shape == (sim.S - 3,)                               # macro not in the action space
+    # noise per PRB scales with the SCS (120 kHz vs 30 kHz -> +6 dB)
+    nz = sim.chan.noise_prb_w
+    assert 10 * np.log10(nz[sim.ctrl[0]] / nz[0]) == pytest.approx(10 * np.log10(4))
+
+
+def test_hetnet_no_cross_tier_interference():
+    sim = ORANSystemSimulator(SimConfig.from_dict(SMALL), seed=0)
+    sim.step(np.zeros(sim.S, int))
+    macro_sec = np.zeros(sim.U, int)                                            # SINR towards macro sector 0
+    ue = np.arange(sim.U)
+    sim.act_last = np.where(sim.controllable, 0.0, 0.5)
+    a = sim.sinr_toward(ue, macro_sec)
+    sim.act_last = np.where(sim.controllable, 1.0, 0.5)                         # mmWave fully loaded
+    b = sim.sinr_toward(ue, macro_sec)
+    assert np.allclose(a, b)
+
+
+def test_hetnet_config_overrides():
+    cfg = SimConfig.from_dict({"hetnet": {"small": {"fc_ghz": 28.0}}, "hetnet.macro.tx_power_dbm": 46.0})
+    assert cfg.hetnet.small.fc_ghz == 28.0 and cfg.hetnet.small.numerology == 3
+    assert cfg.hetnet.macro.tx_power_dbm == 46.0 and cfg.hetnet.macro.fc_ghz == 6.0
+    assert len(SimConfig.from_dict({"hetnet": {"enabled": False}}).tiers()) == 1
+
+
+def test_hetnet_one_macro_per_six_mmwave_sites():
+    cfg = SimConfig.from_dict({"geometry": {"layout": "rings", "n_rings": 2},
+                               "radio": {"los_model": "stochastic"}})
+    dep = build_deployment(cfg.geometry, cfg.radio, hetnet=cfg.hetnet)
+    macro = dep.site_tier == 0
+    assert macro.sum() == 3                                       # 19 layout sites / 6 -> 3 macros
+    assert np.array_equal(np.where(macro)[0], np.arange(3))       # macros come first
+    mxy, sxy = dep.site_xy[macro], dep.site_xy[~macro]
+    assert np.all((mxy >= dep.area_min) & (mxy <= dep.area_max))
+    d = np.hypot(*(mxy[:, None] - mxy[None]).transpose(2, 0, 1))[np.triu_indices(3, 1)]
+    assert d.min() > 1000                                         # spread over the 3.7 x 2.9 km area
+    assert np.hypot(*(sxy[:, None] - mxy[None]).transpose(2, 0, 1)).min() >= cfg.hetnet.macro_exclusion_m
+    assert (dep.sector_tier == 0).sum() == 9
+    # explicit count / positions override the ratio
+    cfg.hetnet.n_macro = 5
+    assert (build_deployment(cfg.geometry, cfg.radio, hetnet=cfg.hetnet).site_tier == 0).sum() == 5
+    cfg.hetnet.macro_latlons = ((34.05, -118.25), (34.04, -118.26))
+    assert (build_deployment(cfg.geometry, cfg.radio, hetnet=cfg.hetnet).site_tier == 0).sum() == 2
+
+
+def test_hetnet_tier_sleep_powers_ordered():
+    for t in SimConfig().tiers():
+        m = ORUPowerModel(t.power, t.radio)
+        sp = [m.sleep_power[k] for k in (1, 2, 3, 4)]
+        assert m.p_full > m.p_idle > sp[0] > sp[1] > sp[2] > sp[3] > 0, t.name

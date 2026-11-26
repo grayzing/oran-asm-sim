@@ -13,7 +13,7 @@ All configs are plain dataclasses so they can be built from an RLlib
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, is_dataclass, asdict
+from dataclasses import dataclass, field, fields, is_dataclass, asdict, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -131,6 +131,109 @@ class RadioConfig:
 
 
 # --------------------------------------------------------------------------- #
+# Heterogeneous network: macro umbrella + mmWave small-cell tiers
+# --------------------------------------------------------------------------- #
+@dataclass
+class TierConfig:
+    """One radio tier (carrier / O-RU class). Fields override :class:`RadioConfig`
+    for the sectors of this tier; everything not listed here (UE noise figure,
+    MIMO ports, CQI table, mobility management, ...) is shared from ``radio``.
+
+    ``tx_power_dbm`` is the total conducted power of one sector (cell), split
+    evenly over ``n_tx_chains``."""
+    name: str = "mmwave"
+    numerology: int = 3            # mu: SCS = 15 * 2^mu kHz, slot = 1 ms / 2^mu (TS 38.211 4.2)
+    fc_ghz: float = 35.0
+    bw_mhz: float = 100.0
+    n_prb: int = 66                # TS 38.101-2 Table 5.3.2-1 (100 MHz @ 120 kHz)
+    rbg_size: int = 8              # TS 38.214 Table 5.1.2.2.1-1, config 2, BWP 37-72 PRBs
+    overhead: float = 0.18         # TS 38.306 4.1.2, FR2 DL overhead
+    tx_power_dbm: float = 35.0     # per sector; 15 dBm/MHz (ITU-R M.2412 dense urban mmWave PSD)
+    n_tx_chains: int = 2           # hybrid beamforming: 2 digital chains (dual-pol panel)
+    scenario: str = "UMi"          # TR 38.901 UMi street canyon (valid to 100 GHz)
+    h_bs_m: float = 10.0           # used where no rooftop height applies (hex layouts)
+    min_dist_2d_m: float = 10.0    # TR 38.901 Table 7.8-1 (UMi)
+    # 8x8 panel: 8 dBi element (TR 38.901 Table 7.3-1) + 18 dB array gain, folded into g_max
+    g_max_dbi: float = 26.0
+    hpbw_h_deg: float = 65.0
+    hpbw_v_deg: float = 10.0
+    downtilt_deg: Optional[float] = None   # None -> per-site tilt from geometry.tilt_ground_m
+    ue_gain_dbi: float = 0.0
+    rsrp_offset_db: float = 0.0    # cell range expansion bias added to this tier's RSRP in cell selection
+    controllable: bool = True      # False -> always on (command 0), not an RL agent
+    power: Dict[str, Any] = field(default_factory=dict)   # PowerConfig overrides for this tier
+
+    @property
+    def scs_khz(self) -> float:
+        return 15.0 * 2 ** self.numerology
+
+    @property
+    def slot_s(self) -> float:
+        return 1e-3 / 2 ** self.numerology
+
+    def to_radio(self, base: "RadioConfig") -> "RadioConfig":
+        umi = self.scenario.upper() == "UMI"
+        return replace(base, scenario="UMi" if umi else "UMa", fc_ghz=self.fc_ghz, bw_mhz=self.bw_mhz,
+                       scs_khz=self.scs_khz, n_prb=self.n_prb, rbg_size=self.rbg_size,
+                       overhead=self.overhead, slot_s=self.slot_s, h_bs_m=self.h_bs_m,
+                       n_tx_chains=self.n_tx_chains,
+                       tx_power_per_chain_w=10 ** (self.tx_power_dbm / 10) * 1e-3 / self.n_tx_chains,
+                       g_max_dbi=self.g_max_dbi, hpbw_h_deg=self.hpbw_h_deg, hpbw_v_deg=self.hpbw_v_deg,
+                       downtilt_deg=base.downtilt_deg if self.downtilt_deg is None else self.downtilt_deg,
+                       ue_gain_dbi=self.ue_gain_dbi, min_dist_2d_m=self.min_dist_2d_m,
+                       sf_corr_dist_los_m=10.0 if umi else 37.0,     # TR 38.901 Table 7.6.3.1-2
+                       sf_corr_dist_nlos_m=13.0 if umi else 50.0)
+
+
+def _macro_tier() -> TierConfig:
+    return TierConfig(name="macro", numerology=1, fc_ghz=6.0, bw_mhz=40.0,
+                      n_prb=106,            # TS 38.101-1 Table 5.3.2-1 (40 MHz @ 30 kHz)
+                      rbg_size=16,          # config 2, BWP 73-144 PRBs
+                      overhead=0.14,        # FR1
+                      tx_power_dbm=49.0,    # per sector; 33 dBm/MHz over 40 MHz
+                      n_tx_chains=4, scenario="UMa", h_bs_m=25.0, min_dist_2d_m=35.0,
+                      g_max_dbi=17.0, hpbw_h_deg=65.0, hpbw_v_deg=10.0,
+                      downtilt_deg=6.0,     # shallow tilt for umbrella coverage of the whole area
+                      controllable=False, power={"sleep_component_load": "idle"})
+
+
+def _mmwave_tier() -> TierConfig:
+    # 10 dB cell range expansion offloads UEs from the macros (typical HetNet CRE: 6-12 dB)
+    return TierConfig(rsrp_offset_db=10.0, power={"sleep_component_load": "idle"})
+
+
+@dataclass
+class HetNetConfig:
+    """Two-tier topology: always-on tri-sector macro O-RUs (umbrella coverage) and
+    mmWave O-RUs on the ``geometry.layout`` sites. There is one macro per
+    ``mmwave_per_macro`` mmWave sites (rounded, at least 1), spread evenly over the
+    study area (centroidal Voronoi layout); a single macro sits at the area centre.
+    ``enabled=False`` gives the homogeneous single-tier network described by
+    ``radio`` alone."""
+    enabled: bool = True
+    macro: TierConfig = field(default_factory=_macro_tier)
+    small: TierConfig = field(default_factory=_mmwave_tier)
+    mmwave_per_macro: float = 6.0      # macro count = max(1, round(n_layout_sites / mmwave_per_macro))
+    n_macro: Optional[int] = None      # explicit macro count (overrides mmwave_per_macro)
+    # explicit macro positions [(lat, lon), ...] (overrides both counts)
+    macro_latlons: Optional[Tuple[Tuple[float, float], ...]] = None
+    macro_height_m: float = 25.0       # UMa h_BS (TR 38.901 Table 7.8-1); on a taller roof: roof + mast
+    macro_exclusion_m: float = 50.0    # small-cell sites closer than this to a macro are dropped
+    macro_layout_seed: int = 0
+
+
+@dataclass
+class Tier:
+    """A resolved tier: the effective radio / power configs of its sectors."""
+    name: str
+    radio: "RadioConfig"
+    power: "PowerConfig"
+    controllable: bool
+    rsrp_offset_db: float
+    downtilt_deg: Optional[float]   # fixed tilt, or None -> geometry.tilt_ground_m rule
+
+
+# --------------------------------------------------------------------------- #
 # Mobility: Time-variant Community model [HSU07]
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -240,6 +343,11 @@ class PowerConfig:
     transition_mix: float = 0.5
     # Constant site-level power (e.g. cooling / O-DU share), added per site
     site_overhead_w: float = 0.0
+    # Operating point of the components that stay on in SMk:
+    #  "reference": at the Table V reference load (the [USMAN25] Table VII convention);
+    #  "idle": at the active-idle point (signalling load), so P_SMk <= P_idle always holds.
+    #  "reference" is only consistent for a PA-dominated O-RU; the HetNet tiers use "idle".
+    sleep_component_load: str = "reference"
 
 
 # --------------------------------------------------------------------------- #
@@ -275,6 +383,18 @@ class SimConfig:
     traffic: TrafficConfig = field(default_factory=TrafficConfig)
     power: PowerConfig = field(default_factory=PowerConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
+    hetnet: HetNetConfig = field(default_factory=HetNetConfig)
+
+    # ------------------------------------------------------------------ #
+    def tiers(self) -> List[Tier]:
+        """Resolved tiers. HetNet: [macro (0), small cells (1)]; otherwise [cell (0)]."""
+        if not self.hetnet.enabled:
+            return [Tier("cell", self.radio, self.power, True, 0.0, None)]
+        out = []
+        for tc in (self.hetnet.macro, self.hetnet.small):
+            out.append(Tier(tc.name, tc.to_radio(self.radio), replace(self.power, **tc.power),
+                            tc.controllable, tc.rsrp_offset_db, tc.downtilt_deg))
+        return out
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -298,10 +418,16 @@ class SimConfig:
             elif isinstance(v, SimConfig):
                 return v
         for sec, kv in nested.items():
+            for key in [k for k in kv if "." in k]:          # "hetnet.small.fc_ghz"
+                head, rest = key.split(".", 1)
+                kv.setdefault(head, {})[rest] = kv.pop(key)
             sub = getattr(cfg, sec)
             for key, val in kv.items():
                 if not hasattr(sub, key):
                     raise KeyError(f"unknown config key {sec}.{key}")
+                if sec == "hetnet" and isinstance(getattr(sub, key), TierConfig):
+                    if isinstance(val, dict):
+                        val = replace(getattr(sub, key), **val)
                 if sec == "mobility" and key == "periods" and isinstance(val, dict):
                     val = {n: (p if isinstance(p, PeriodConfig) else PeriodConfig(name=n, **p))
                            for n, p in val.items()}

@@ -20,6 +20,15 @@ Per-sector sleep command (action)
 4      : SM4 - cell switch-off: deactivation 0.5 s -> deep sleep -> activation
          0.5 s when any other command is given. UEs are handed over at once;
          no SSB is transmitted while in SM4.
+
+Heterogeneous network (``cfg.hetnet``, on by default)
+-----------------------------------------------------
+Sector tiers (``dep.sector_tier``): tier 0 is the always-on macro O-RU at the
+centre (6 GHz, mu=1, 40 MHz, 49 dBm per sector), tier 1 the mmWave O-RUs around
+it (35 GHz, mu=3, 100 MHz, 35 dBm per sector). Tiers sit on separate carriers, so
+interference is intra-tier only; each tier has its own PRB grid, slot length,
+noise per PRB and power model. Commands for non-controllable sectors (the macro)
+are ignored: they are always 0. Cell selection is max RSRP (+ per-tier CRE offset).
 """
 from __future__ import annotations
 
@@ -31,7 +40,7 @@ from .channel import LargeScaleChannel, link_rates, mimo_eigs, o2i_loss_db, samp
 from .config import SimConfig
 from .geometry import build_deployment
 from .mobility import TVCMobility
-from .power import ASM_TIMING, ORUPowerModel
+from .power import ASM_TIMING, ORUPowerModel, SectorPowerModel
 from .scheduler import pf_schedule
 from .traffic import FTP3Traffic
 
@@ -42,18 +51,33 @@ STATE_NAMES = ("on", "deactivating", "sm4", "activating")
 class ORANSystemSimulator:
     def __init__(self, cfg: Optional[SimConfig] = None, seed: Optional[int] = None):
         self.cfg = cfg or SimConfig()
-        self.dep = build_deployment(self.cfg.geometry, self.cfg.radio)
+        self.tiers = self.cfg.tiers()
+        self.dep = build_deployment(self.cfg.geometry, self.cfg.radio, hetnet=self.cfg.hetnet)
         r = self.cfg.radio
         self.S = self.dep.n_sectors
+        self.n_tiers = len(self.tiers)
+        st = self.sector_tier = np.asarray(self.dep.sector_tier, int)
+        self.tier_masks = [st == t for t in range(self.n_tiers)]
+        self.controllable = np.array([t.controllable for t in self.tiers])[st]          # [S]
+        self.ctrl = np.where(self.controllable)[0]
+        self.rsrp_offset = np.array([t.rsrp_offset_db for t in self.tiers])[st]
         e = self.cfg.env
         self.U = int(e.n_ues) if e.n_ues else int(round(e.ues_per_sector * self.S))
-        self.B = r.n_rbg
-        self.prb_per_rbg = np.full(self.B, r.rbg_size, float)
-        self.prb_per_rbg[-1] = r.n_prb - r.rbg_size * (self.B - 1)
-        self.power = ORUPowerModel(self.cfg.power, r)
+        # common RBG axis = the largest tier grid; a smaller grid is padded with 0-PRB RBGs
+        self.B = max(t.radio.n_rbg for t in self.tiers)
+        prb = np.zeros((self.n_tiers, self.B))
+        for i, t in enumerate(self.tiers):
+            nb = t.radio.n_rbg
+            prb[i, :nb] = t.radio.rbg_size
+            prb[i, nb - 1] = t.radio.n_prb - t.radio.rbg_size * (nb - 1)
+        self.prb_per_rbg = prb[st]                                                   # [S, B]
+        self.rbg_valid = self.prb_per_rbg > 0
+        self.overhead = np.array([t.radio.overhead for t in self.tiers])[st]
+        self.power = SectorPowerModel([ORUPowerModel(t.power, t.radio) for t in self.tiers], st)
         self.dt_mini = self.cfg.env.decision_interval_s / self.cfg.env.n_mini
-        self.slots_per_mini = self.dt_mini / r.slot_s * r.tdd_dl_fraction
-        self.p_ref_total = self.S * self.power.p_full + self.dep.n_sites * self.cfg.power.site_overhead_w
+        self.slots_per_mini = np.array([self.dt_mini / t.radio.slot_s * t.radio.tdd_dl_fraction
+                                        for t in self.tiers])[st]                    # [S]
+        self.p_ref_total = float(self.power.p_full.sum()) + self.dep.n_sites * self.cfg.power.site_overhead_w
         self.reset(seed)
 
     # ------------------------------------------------------------------ #
@@ -65,9 +89,12 @@ class ORANSystemSimulator:
         self.t = float(start_hour) * 3600.0
         self.mob = TVCMobility(self.cfg.mobility, self.dep, self.U, self.rng, r)
         self.traffic = FTP3Traffic(self.cfg.traffic, self.U, self.rng)
-        self.chan = LargeScaleChannel(self.dep, r, self.U, self.rng)
-        self.o2i_base_db, self.o2i_din = o2i_loss_db(self.rng, self.U, r.fc_ghz, self.mob.high_loss_bld,
-                                                     return_parts=True)
+        self.chan = LargeScaleChannel(self.dep, [t.radio for t in self.tiers], self.U, self.rng)
+        # O2I penetration is frequency dependent: one draw per tier carrier, shared indoor distance
+        o2i = [o2i_loss_db(self.rng, self.U, t.radio.fc_ghz, self.mob.high_loss_bld, return_parts=True)
+               for t in self.tiers]
+        self.o2i_base_db = np.stack([b for b, _ in o2i], 1)                         # [U, n_tiers]
+        self.o2i_din = o2i[0][1]
         self.k_los = db2lin(r.rician_k_los_db)
 
         U, S = self.U, self.S
@@ -105,6 +132,7 @@ class ORANSystemSimulator:
     def _apply_actions(self, actions):
         a = np.asarray(actions, int).reshape(-1)
         assert a.shape[0] == self.S, f"expected {self.S} actions, got {a.shape[0]}"
+        a = np.where(self.controllable, a, 0)          # always-on tiers (macro) ignore commands
         td4, _, ta4 = ASM_TIMING[4]
         prev = self.state.copy()
         off_cmd = a == 4
@@ -120,6 +148,15 @@ class ORANSystemSimulator:
         self.state_age = np.where(self.state != prev, 0.0, self.state_age)
 
     # ------------------------------------------------------------------ #
+    def _selection_metric(self, G, on=None):
+        """Cell-selection metric [U,S]: RSRP per RE [dBm] + tier CRE offset for cells that
+        are on and above ``rsrp_min_dbm``, -inf otherwise."""
+        rsrp = 10 * np.log10(np.maximum(G / 12.0, 1e-30)) + 30
+        ok = rsrp >= self.cfg.radio.rsrp_min_dbm
+        if on is not None:
+            ok &= on[None, :]
+        return np.where(ok, rsrp + self.rsrp_offset[None, :], -np.inf)
+
     def _associate(self, G, acc=None):
         """RSRP association with hysteresis. Returns the number of handovers; if ``acc`` is
         given, the handover breakdown is accumulated into it:
@@ -135,16 +172,16 @@ class ORANSystemSimulator:
         """
         r = self.cfg.radio
         on = self.state == ON
-        rsrp = 10 * np.log10(np.maximum(G / 12.0, 1e-30)) + 30          # RSRP per RE [dBm]
-        rsrp_m = np.where(on[None, :], rsrp, -np.inf)
-        best = np.argmax(rsrp_m, 1)
-        best_v = rsrp_m[np.arange(self.U), best]
+        metric = self._selection_metric(G, on)
+        ar = np.arange(self.U)
+        best = np.argmax(metric, 1)
+        best_v = metric[ar, best]
         cur = self.serving
         cur_ok = (cur >= 0) & on[np.maximum(cur, 0)]
-        cur_v = np.where(cur_ok, rsrp_m[np.arange(self.U), np.maximum(cur, 0)], -np.inf)
-        keep = cur_ok & (best_v < cur_v + r.ho_hysteresis_db) & (cur_v >= r.rsrp_min_dbm)
+        cur_v = np.where(cur_ok, metric[ar, np.maximum(cur, 0)], -np.inf)
+        keep = cur_ok & np.isfinite(cur_v) & (best_v < cur_v + r.ho_hysteresis_db)
         new = np.where(keep, cur, best)
-        new = np.where(rsrp_m[np.arange(self.U), new] < r.rsrp_min_dbm, -1, new)
+        new = np.where(np.isfinite(metric[ar, new]), new, -1)
         is_ho = (cur >= 0) & (new >= 0) & (new != cur)
         ho = int(is_ho.sum())
         if ho:
@@ -177,10 +214,11 @@ class ORANSystemSimulator:
         cfg, r, pw = self.cfg, self.cfg.radio, self.power
         S, U, B, dt = self.S, self.U, self.B, self.dt_mini
         self._apply_actions(actions)
-        P_idle = pw.p_idle
+        P_idle = pw.p_idle                                          # [S]
         mix = cfg.power.transition_mix
-        P_sm = np.array([P_idle] + [pw.sleep_power[k] for k in (1, 2, 3, 4)])
-        P_tr = mix * P_idle + (1 - mix) * P_sm                      # transition power per level
+        P_sm = np.stack([P_idle] + [pw.sleep_power[k] for k in (1, 2, 3, 4)], 1)   # [S, 5]
+        P_tr = mix * P_idle[:, None] + (1 - mix) * P_sm             # transition power per level
+        ar_s = np.arange(S)
         t_d = np.array([0.0] + [ASM_TIMING[k][0] for k in (1, 2, 3)])
         t_a = np.array([0.0] + [ASM_TIMING[k][2] for k in (1, 2, 3)])
 
@@ -204,8 +242,9 @@ class ORANSystemSimulator:
                 indoor = self.mob.indoor
                 d_in = self.o2i_din
             if i_mini % ls_every == 0 or self.G is None:
-                o2i = self.o2i_base_db + 0.5 * d_in
-                extra = np.where(indoor, o2i, 0.0) + np.where(self.mob.in_car & ~indoor, self.mob.car_loss_db, 0.0)
+                o2i = self.o2i_base_db + 0.5 * d_in[:, None]                         # [U, n_tiers]
+                extra = (np.where(indoor[:, None], o2i, 0.0)
+                         + np.where(self.mob.in_car & ~indoor, self.mob.car_loss_db, 0.0)[:, None])
                 self.G = self.chan.update(xy, extra)
                 self._indoor = indoor
             G, indoor = self.G, self._indoor
@@ -225,19 +264,28 @@ class ORANSystemSimulator:
             on = self.state == ON
             act = np.where(on, np.maximum(self.util, cfg.power.signalling_load), 0.0)
             self.act_last = act
-            mask = (self.rng.random((S, B)) < act[:, None]).astype(float)
-            if r.interference_fading:
-                Iub = np.einsum("us,sb,usb->ub", G, mask, self.rng.exponential(1.0, (U, S, B)))
-            else:
-                Iub = G @ mask
+            mask = ((self.rng.random((S, B)) < act[:, None]) & self.rbg_valid).astype(float)
             sidx = np.maximum(serv, 0)
+            s_tier = self.sector_tier[sidx]
+            # interference only from sectors on the serving carrier (tiers use separate spectrum)
+            Iub = np.zeros((U, B))
+            fad = self.rng.exponential(1.0, (U, S, B)) if r.interference_fading else None
+            for t, mt in enumerate(self.tier_masks):
+                ut = s_tier == t
+                if not ut.any():
+                    continue
+                if fad is not None:
+                    Iub[ut] = np.einsum("us,sb,usb->ub", G[np.ix_(ut, mt)], mask[mt], fad[np.ix_(ut, mt)])
+                else:
+                    Iub[ut] = G[np.ix_(ut, mt)] @ mask[mt]
             g_srv = G[np.arange(U), sidx]
             own = g_srv[:, None] * mask[sidx]
-            I = np.maximum(Iub - own, 0.0) + self.chan.noise_prb_w
-            rho = np.where(cov[:, None], g_srv[:, None] / I, 0.0)
+            I = np.maximum(Iub - own, 0.0) + self.chan.noise_prb_w[sidx][:, None]
+            valid = self.rbg_valid[sidx]
+            rho = np.where(cov[:, None] & valid, g_srv[:, None] / I, 0.0)
 
             # ---------------- 2x2 SU-MIMO link abstraction (only for backlogged, covered UEs)
-            self.wb_sinr_db = 10 * np.log10(np.maximum(rho.mean(1), 1e-12))
+            self.wb_sinr_db = 10 * np.log10(np.maximum(rho.sum(1) / valid.sum(1), 1e-12))
             idx = np.where(cov & (self.backlog > 0))[0]
             rates = np.zeros((idx.size, B))
             rank = np.zeros(idx.size)
@@ -245,8 +293,10 @@ class ORANSystemSimulator:
             if idx.size:
                 k_lin = np.where(self.chan.los_sector[idx, sidx[idx]] & ~indoor[idx], self.k_los, 0.0)
                 H = sample_mimo_channel(self.rng, idx.size, B, r.n_rx_ue, r.n_tx_ports, k_lin)
-                bits_slot, rank, mod = link_rates(rho[idx], mimo_eigs(H), r, self.prb_per_rbg)
-                rates = bits_slot * self.slots_per_mini
+                si = sidx[idx]
+                bits_slot, rank, mod = link_rates(rho[idx], mimo_eigs(H), r, self.prb_per_rbg[si],
+                                                  overhead=self.overhead[si])
+                rates = bits_slot * self.slots_per_mini[si][:, None]
 
             # ---------------- ASM-aware available service time
             arr_s = np.bincount(serv[cov], weights=(n_files[cov] > 0).astype(float), minlength=S)
@@ -267,7 +317,8 @@ class ORANSystemSimulator:
                 num = np.bincount(serv[idx], weights=w, minlength=S)
                 self.streams = np.where(num > 1e-6, np.bincount(serv[idx], weights=w * rank, minlength=S)
                                         / np.maximum(num, 1e-9), self.streams)
-                mod_u = mod.mean(1)
+                vi = valid[idx]
+                mod_u = (mod * vi).sum(1) / vi.sum(1)
                 self.mod_bits = np.where(num > 1e-6, np.bincount(serv[idx], weights=w * mod_u, minlength=S)
                                          / np.maximum(num, 1e-9), self.mod_bits)
             busy = np.where(on, np.minimum(busy, t_avail), 0.0)
@@ -283,22 +334,23 @@ class ORANSystemSimulator:
             # ---------------- energy integration
             idle = np.where(on, np.maximum(t_avail - busy, 0.0), 0.0)   # fraction of dt
             wake = np.where(on, 1.0 - t_avail, 0.0)
-            p_busy = pw.active(np.ones(S), self.streams, self.mod_bits).total
+            p_busy = pw.active(np.ones(S), self.streams, self.mod_bits)
             n_ssb = idle * dt / cfg.power.ssb_period_s
             n_t = n_t_est * (lvl > 0)
             n_g = n_ssb + n_t
             gbar = np.where(n_g > 0, idle * dt / np.maximum(n_g, 1e-12), 0.0)
             can = (lvl > 0) & (gbar >= (t_d[lvl] + t_a[lvl])) & on
-            e_sleep_ssb = n_ssb * ((t_d[lvl] + t_a[lvl]) * P_tr[lvl] + (gbar - t_d[lvl] - t_a[lvl]) * P_sm[lvl])
-            e_sleep_trf = n_t * (t_d[lvl] * P_tr[lvl] + (gbar - t_d[lvl]) * P_sm[lvl])
-            e_idle_on = np.where(can, e_sleep_ssb + e_sleep_trf + wake * dt * P_tr[lvl],
+            P_tr_l, P_sm_l = P_tr[ar_s, lvl], P_sm[ar_s, lvl]
+            e_sleep_ssb = n_ssb * ((t_d[lvl] + t_a[lvl]) * P_tr_l + (gbar - t_d[lvl] - t_a[lvl]) * P_sm_l)
+            e_sleep_trf = n_t * (t_d[lvl] * P_tr_l + (gbar - t_d[lvl]) * P_sm_l)
+            e_idle_on = np.where(can, e_sleep_ssb + e_sleep_trf + wake * dt * P_tr_l,
                                  (idle + wake) * dt * P_idle)
             sleep_t = np.where(can, n_ssb * (gbar - t_d[lvl] - t_a[lvl]) + n_t * (gbar - t_d[lvl]), 0.0)
             e_on = busy * dt * p_busy + e_idle_on
 
             # SM4 state machine (DEACT -> OFF, ACT -> ON)
             frac = np.clip(self.timer / dt, 0.0, 1.0)
-            P_sm4, P_tr4 = P_sm[4], P_tr[4]
+            P_sm4, P_tr4 = P_sm[:, 4], P_tr[:, 4]
             e_deact = dt * (frac * P_tr4 + (1 - frac) * P_sm4)
             e_act = dt * (frac * P_tr4 + (1 - frac) * P_idle)
             energy = np.select([self.state == ON, self.state == DEACT, self.state == OFF, self.state == ACT],
@@ -338,6 +390,8 @@ class ORANSystemSimulator:
         p_total = p_sector.sum() + self.dep.n_sites * cfg.power.site_overhead_w
         tput = acc["served"] / T
         dem = demand_mask & (self.serving >= 0)
+        n_ue_sector = np.bincount(self.serving[self.serving >= 0], minlength=S)
+        st, nt = self.sector_tier, self.n_tiers
         out = dict(
             time_s=self.t, hour=(self.t / 3600) % 24, period=self.mob.period,
             power_sector_w=p_sector, power_total_w=p_total, energy_j=p_total * T,
@@ -360,8 +414,14 @@ class ORANSystemSimulator:
             occupancy_sector=acc["occ7"] / T,            # cols: noASM, SM1, SM2, SM3, deact, SM4, act
             wake_latency_s=acc["wake_lat"].sum() / max(acc["n_bursts"].sum(), 1.0),
             backlog_bits=self.backlog.sum(),
-            n_ue_sector=np.bincount(self.serving[self.serving >= 0], minlength=S),
+            n_ue_sector=n_ue_sector,
             state_sector=self.state.copy(),
+            # per tier (HetNet: 0 = macro, 1 = mmWave)
+            power_tier_w=np.bincount(st, weights=p_sector, minlength=nt),
+            power_fixed_w=float(p_sector[~self.controllable].sum()),   # always-on (macro) sectors
+            power_ctrl_w=float(p_sector[self.controllable].sum()),     # controllable (mmWave) sectors
+            served_tier_bps=np.bincount(st, weights=acc["served_sec"] / T, minlength=nt),
+            n_ue_tier=np.bincount(st, weights=n_ue_sector, minlength=nt),
         )
         self.last = out
         self.step_count += 1
@@ -389,10 +449,14 @@ class ORANSystemSimulator:
         if self.G is None:
             return np.full(len(ue_idx), -10.0)
         g = self.G[ue_idx, sec_idx]
-        itot = self.G[ue_idx] @ self.act_last
-        i = np.maximum(itot - g * self.act_last[sec_idx], 0.0) + self.chan.noise_prb_w
+        same = self.sector_tier[None, :] == self.sector_tier[sec_idx][:, None]      # co-channel sectors
+        itot = (self.G[ue_idx] * same) @ self.act_last
+        i = np.maximum(itot - g * self.act_last[sec_idx], 0.0) + self.chan.noise_prb_w[sec_idx]
         return 10 * np.log10(np.maximum(g / i, 1e-12))
 
     def best_sector_if_all_on(self) -> np.ndarray:
         """Sector each UE would pick if every cell were on (for coverage-aware policies)."""
-        return np.argmax(self.G, 1) if self.G is not None else np.zeros(self.U, int)
+        if self.G is None:
+            return np.zeros(self.U, int)
+        m = self._selection_metric(self.G)
+        return np.where(np.isfinite(m).any(1), np.argmax(m, 1), np.argmax(self.G, 1))

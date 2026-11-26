@@ -16,7 +16,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .config import GeometryConfig, RadioConfig
+from .config import GeometryConfig, HetNetConfig, RadioConfig
 
 EARTH_R = 6_371_008.8
 
@@ -94,6 +94,12 @@ class Deployment:
     site_vis: Optional[np.ndarray] = None      # [n_sites, n_cells] bool viewsheds (LOS to h_ut)
     placement: Optional[object] = None
     buildings_source: str = "none"
+    site_tier: Optional[np.ndarray] = None     # [n_sites] tier index (HetNet: 0 = macro, 1 = mmWave)
+    tier_names: Tuple[str, ...] = ("cell",)
+
+    def __post_init__(self):
+        if self.site_tier is None:
+            self.site_tier = np.zeros(len(self.site_xy), int)
 
     @property
     def n_sites(self) -> int:
@@ -102,6 +108,14 @@ class Deployment:
     @property
     def n_sectors(self) -> int:
         return len(self.sector_site)
+
+    @property
+    def sector_tier(self) -> np.ndarray:
+        return self.site_tier[self.sector_site]
+
+    @property
+    def n_tiers(self) -> int:
+        return len(self.tier_names)
 
     @property
     def sector_xy(self) -> np.ndarray:
@@ -395,9 +409,54 @@ def load_building_raster(geo: GeometryConfig, proj, area_min, area_max, bbox):
     return r, source, path
 
 
+def macro_sites(het: HetNetConfig, proj, area_min, area_max, center, n_small: int,
+                polygon: Optional[np.ndarray] = None) -> np.ndarray:
+    """Macro O-RU positions [M, 2]. Explicit ``macro_latlons`` win; otherwise
+    M = ``n_macro`` or max(1, round(n_small / mmwave_per_macro)). One macro sits at
+    ``center``; several are spread evenly over the study area as the generators of
+    a centroidal Voronoi tessellation (Lloyd's algorithm on an area grid), which
+    gives each macro an umbrella cell of about equal area."""
+    if het.macro_latlons:
+        ll = np.asarray(het.macro_latlons, float).reshape(-1, 2)
+        return proj.to_xy(ll[:, 0], ll[:, 1]).reshape(-1, 2)
+    m = het.n_macro if het.n_macro is not None else int(np.floor(n_small / het.mmwave_per_macro + 0.5))
+    m = max(int(m), 1)
+    if m == 1:
+        return np.asarray(center, float).reshape(1, 2)
+    lo, hi = np.asarray(area_min, float), np.asarray(area_max, float)
+    step = float(np.sqrt(np.prod(hi - lo) / 20000.0))            # ~20k grid points
+    gx = np.arange(lo[0] + step / 2, hi[0], step)
+    gy = np.arange(lo[1] + step / 2, hi[1], step)
+    pts = np.stack(np.meshgrid(gx, gy), -1).reshape(-1, 2)
+    if polygon is not None:
+        inside = points_in_polygon(pts, polygon)
+        pts = pts[inside] if inside.any() else pts
+    rng = np.random.default_rng(het.macro_layout_seed)
+    # k-means++ initialisation, then Lloyd iterations
+    c = [pts[rng.integers(len(pts))]]
+    for _ in range(m - 1):
+        d2 = np.min(((pts[:, None, :] - np.asarray(c)[None]) ** 2).sum(-1), 1)
+        c.append(pts[rng.choice(len(pts), p=d2 / d2.sum())])
+    c = np.asarray(c)
+    for _ in range(100):
+        lab = np.argmin(((pts[:, None, :] - c[None]) ** 2).sum(-1), 1)
+        new = np.stack([pts[lab == k].mean(0) if np.any(lab == k) else c[k] for k in range(m)])
+        if np.allclose(new, c, atol=0.1):
+            c = new
+            break
+        c = new
+    return c
+
+
 def build_deployment(geo: GeometryConfig, radio: Optional[RadioConfig] = None,
-                     pois: Sequence[POI] = DTLA_POIS) -> Deployment:
+                     pois: Sequence[POI] = DTLA_POIS, hetnet: Optional[HetNetConfig] = None) -> Deployment:
+    """Study area, buildings and sites. With an enabled ``hetnet`` the macro O-RUs are
+    the first sites (tier 0, see :func:`macro_sites`) and the ``geo.layout`` sites
+    (minus any within ``macro_exclusion_m`` of a macro) are the small-cell O-RUs (tier 1)."""
     radio = radio or RadioConfig()
+    het = hetnet is not None and hetnet.enabled
+    tiers = [hetnet.macro, hetnet.small] if het else []
+    small_radio = tiers[1].to_radio(radio) if het else radio
     s, w, n, e = geo.bbox
     poly_xy = None
     if geo.area_geojson:
@@ -421,7 +480,7 @@ def build_deployment(geo: GeometryConfig, radio: Optional[RadioConfig] = None,
     az_off = None
     if geo.layout == "viewshed":
         from .placement import place_sites
-        placement = place_sites(bld, geo, radio)
+        placement = place_sites(bld, geo, small_radio)
         sites, site_h, az_off = placement.site_xy, placement.site_h, placement.az_offset
     elif geo.layout == "rings":
         sites = hex_ring_sites(geo.n_rings, geo.isd_m, geo.lattice_rotation_deg) + center
@@ -432,20 +491,40 @@ def build_deployment(geo: GeometryConfig, radio: Optional[RadioConfig] = None,
         raise ValueError(f"unknown layout {geo.layout}")
     if len(sites) == 0:
         raise ValueError("no sites inside the study area")
-    n_sites = len(sites)
     if geo.layout != "viewshed":
-        site_h = np.full(n_sites, radio.h_bs_m)
-        az_off = np.zeros(n_sites)
+        site_h = np.full(len(sites), small_radio.h_bs_m)
+        az_off = np.zeros(len(sites))
         if bld is not None:   # a hex site inside a footprint sits on that roof (+ mast) if taller
-            roof = bld.height_at(sites)
-            site_h = np.maximum(site_h, roof + geo.mast_height_m)
+            site_h = np.maximum(site_h, bld.height_at(sites) + geo.mast_height_m)
+    site_h = np.asarray(site_h, float)
+    keep = np.ones(len(sites), bool)
+    site_tier = np.zeros(len(sites), int)
+
+    n_macro = 0
+    if het:
+        mxy = macro_sites(hetnet, proj, area_min, area_max, center, len(sites), poly_xy)
+        n_macro = len(mxy)
+        dmin = np.hypot(*(sites[:, None, :] - mxy[None, :, :]).transpose(2, 0, 1)).min(1)
+        keep = dmin >= hetnet.macro_exclusion_m
+        mh = np.full(n_macro, hetnet.macro_height_m)
+        if bld is not None:
+            mh = np.maximum(mh, bld.height_at(mxy) + geo.mast_height_m)
+        sites = np.vstack([mxy, sites[keep]])
+        site_h = np.concatenate([mh, site_h[keep]])
+        az_off = np.concatenate([np.zeros(n_macro), az_off[keep]])
+        site_tier = np.concatenate([np.zeros(n_macro, int), np.ones(int(keep.sum()), int)])
+    n_sites = len(sites)
 
     site_vis = None
     if bld is not None and radio.los_model == "geometry":
+        from .placement import site_viewsheds
         if placement is not None:
-            site_vis = placement.vis
+            site_vis = placement.vis[keep]
+            if het:
+                mvis = site_viewsheds(bld, sites[:n_macro], site_h[:n_macro], radio.h_ut_m,
+                                      max(geo.viewshed_radius_m, 1500.0), geo.cache_dir)
+                site_vis = np.vstack([mvis, site_vis])
         else:
-            from .placement import site_viewsheds
             site_vis = site_viewsheds(bld, sites, site_h, radio.h_ut_m, max(geo.viewshed_radius_m, 1500.0),
                                       geo.cache_dir)
 
@@ -453,6 +532,9 @@ def build_deployment(geo: GeometryConfig, radio: Optional[RadioConfig] = None,
         tilt = np.degrees(np.arctan2(site_h - radio.h_ut_m, geo.tilt_ground_m))
     else:
         tilt = np.full(n_sites, radio.downtilt_deg)
+    for t, tc in enumerate(tiers):        # a tier with a fixed downtilt overrides the ground-aim rule
+        if tc.downtilt_deg is not None:
+            tilt[site_tier == t] = tc.downtilt_deg
 
     sector_site = np.repeat(np.arange(n_sites), 3)
     sector_az = (np.tile(np.asarray(geo.sector_azimuths_deg, float), n_sites) + np.repeat(az_off, 3)) % 360.0
@@ -464,8 +546,9 @@ def build_deployment(geo: GeometryConfig, radio: Optional[RadioConfig] = None,
                       sector_site=sector_site, sector_az_deg=sector_az, poi_xy=poi_xy,
                       poi_names=[p.name for p in in_box], poi_tags=[p.tags for p in in_box],
                       poi_weights=np.asarray([p.weight for p in in_box], float),
-                      buildings=bld, area_polygon_xy=poly_xy, site_h=np.asarray(site_h, float),
-                      site_tilt_deg=tilt, site_vis=site_vis, placement=placement, buildings_source=source)
+                      buildings=bld, area_polygon_xy=poly_xy, site_h=site_h,
+                      site_tilt_deg=tilt, site_vis=site_vis, placement=placement, buildings_source=source,
+                      site_tier=site_tier, tier_names=tuple(t.name for t in tiers) or ("cell",))
 
 
 def bbox_geojson(bbox, name="Downtown Los Angeles") -> dict:

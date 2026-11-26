@@ -5,10 +5,17 @@
 You can use it at three levels:
 
 1. **As a plain simulator.** Call `ORANSystemSimulator.step(commands)` and read the metrics. RL libraries are not needed.
-2. **As a Gymnasium environment.** `ORanASMEnv` has one central agent with a `MultiDiscrete` action (one entry per sector).
-3. **As an RLlib `MultiAgentEnv`.** `ORanASMMultiAgentEnv` has one agent per O-RU. Each agent sets the sleep commands of its three sectors with a `MultiDiscrete([5, 5, 5])` action.
+2. **As a Gymnasium environment.** `ORanASMEnv` has one central agent with a `MultiDiscrete` action (one entry per controllable sector).
+3. **As an RLlib `MultiAgentEnv`.** `ORanASMMultiAgentEnv` has one agent per controllable O-RU. Each agent sets the sleep commands of its three sectors with a `MultiDiscrete([5, 5, 5])` action.
 
-The default scenario is Downtown Los Angeles. Sites are placed on rooftops by iterative maximum-visibility placement, and LOS comes from building geometry. Everything (area, buildings, layout, radio, traffic, mobility, power model) is configurable.
+The default scenario is a two-tier **HetNet** over Downtown Los Angeles (see [HetNet topology](#hetnet-topology)):
+
+| Tier | Where | Carrier | Numerology | Bandwidth | TX power (per sector) | Controlled by RL |
+|---|---|---|---|---|---|---|
+| Macro O-RUs (umbrella) | 1 tri-sector site per 6 mmWave sites, spread evenly over the area (8 by default) | 6 GHz | μ = 1 (30 kHz, 106 PRB) | 40 MHz | 49 dBm | no, always on |
+| mmWave O-RUs | rooftop sites around it (viewshed placement) | 35 GHz | μ = 3 (120 kHz, 66 PRB) | 100 MHz | 35 dBm | yes |
+
+LOS comes from building geometry. Everything (area, buildings, layout, tiers, radio, traffic, mobility, power model) is configurable; `{"hetnet": {"enabled": False}}` gives the original homogeneous 3.5 GHz network.
 
 ---
 
@@ -119,13 +126,16 @@ You can restrict the commands an agent may use with `env.action_set`, for exampl
 
 **O-RUs and sectors.** Each site hosts one O-RU, and each O-RU drives three sectors (azimuths 30°/150°/270°, rotated per site by viewshed placement). Every sector has its own RF chain and its own sleep state, so commands are given per sector. `sim.dep.sector_site[s]` gives the site (O-RU) of sector `s`.
 
-**Single agent (`ORanASMEnv`).** One central controller. The action is `MultiDiscrete([L] * n_sectors)`, one command index per sector, where `L = len(env.action_set)`.
+**Always-on sectors.** The HetNet macro O-RUs are not agents. `sim.ctrl` lists the controllable (mmWave) sector indices and `sim.controllable` is the matching `[S]` mask. `sim.step(commands)` still takes one command per sector (all `S`), but commands for the macro sectors are ignored (always 0, no ASM). The macro's power counts towards `power_total_w`.
 
-**Multi-agent (`ORanASMMultiAgentEnv`).** One agent per O-RU, with IDs `"oru_0"`, `"oru_1"`, ... (one per site). Agent `oru_i` controls the three sectors `ma.sectors_of[i]`, in that order, and its action is `MultiDiscrete([L, L, L])`. All agents act at every step. To convert per-O-RU actions to a per-sector array, call `ma.sector_actions(actions)` with either a dict keyed by agent ID or an array of shape `[n_oru, 3]`; agents missing from a dict send command index 0. The full metrics `info` dict is attached to the first agent's info.
+**Single agent (`ORanASMEnv`).** One central controller. The action is `MultiDiscrete([L] * len(env.ctrl))`, one command index per controllable sector, where `L = len(env.action_set)`. The per-sector observation covers the controllable sectors; the macro's mean utilisation and share of attached UEs are in the global features (`macro_util`, `macro_ue_frac`).
+
+**Multi-agent (`ORanASMMultiAgentEnv`).** One agent per controllable O-RU, with IDs `"oru_0"`, `"oru_1"`, ... Agent `oru_i` sits on site `ma.oru_site[i]`, controls the three sectors `ma.sectors_of[i]`, in that order, and its action is `MultiDiscrete([L, L, L])`. All agents act at every step. To convert per-O-RU actions to a per-sector array over all `S` sectors, call `ma.sector_actions(actions)` with either a dict keyed by agent ID or an array of shape `[n_oru, 3]`; agents missing from a dict, and the macro sectors, get command index 0. The full metrics `info` dict is attached to the first agent's info.
 
 | Attribute | Shape | Meaning |
 |---|---|---|
-| `ma.n_oru` | | number of O-RUs (sites) |
+| `ma.n_oru` | | number of controllable O-RUs (mmWave sites) |
+| `ma.oru_site` | `[n_oru]` | site index of each agent |
 | `ma.sectors_of` | `[n_oru, 3]` | sector indices controlled by each O-RU |
 | `ma.core` | | the underlying `ORanASMEnv`; the simulator is `ma.core.sim` |
 
@@ -145,6 +155,7 @@ All configuration lives in nested dataclasses in [oran_asm_sim/config.py](oran_a
 | `traffic` | `TrafficConfig` | FTP-3 file size and rate, diurnal profile, delay budget |
 | `power` | `PowerConfig` | O-RU power model and sleep-mode parameters |
 | `env` | `EnvConfig` | step length, episode length, UE count, start hour, reward weights, seed |
+| `hetnet` | `HetNetConfig`, `TierConfig` | macro / mmWave tiers: carrier, numerology, bandwidth, TX power, antenna, CRE offset, macro position |
 
 Every default value has its source cited inline in `config.py`. Each environment takes a partial nested dict, which is the same format as RLlib's `env_config`. Any key you leave out keeps its default:
 
@@ -156,7 +167,7 @@ env = ORanASMEnv({
 })
 ```
 
-Dotted keys also work: `{"radio.scenario": "UMi", "env.seed": 1}`. A misspelled key raises `KeyError`, so typos fail loudly.
+Dotted keys also work: `{"radio.scenario": "UMi", "env.seed": 1, "hetnet.small.fc_ghz": 28.0}`. A misspelled key raises `KeyError`, so typos fail loudly.
 
 **Presets.** The presets in `PRESETS` are named starting points:
 
@@ -360,6 +371,7 @@ The `info` dict returned by `step()` contains these scalars:
 | `state_sector` | `[S]` | cell state at the end of the step |
 | `ue_offered_bps`, `ue_served_bps` | `[U]` | offered and served rate per UE |
 | `ho_out_sector`, `ho_in_sector` | `[S]` | handovers out of and into each sector |
+| `power_tier_w`, `served_tier_bps`, `n_ue_tier` | `[n_tiers]` | power, throughput and attached UEs per tier (0 = macro, 1 = mmWave) |
 
 ---
 
@@ -377,6 +389,26 @@ The `info` dict returned by `step()` contains these scalars:
 | Placement | `placement.py` | Candidates are rooftop cells on building edges that face the service area, keeping the tallest roof per 40 m cell (up to 1200). A greedy loop adds the site that increases LOS-visible service area the most. Each site's azimuth is rotated to cover what it sees, and its downtilt aims 250 m out. The result is cached: about 10 s the first time, about 0.05 s afterwards. |
 | Power and ASMs | `power.py` | Usman et al. (CCNC 2025), Eq. (2)/(4)/(5)/(6): scaling exponents from Tables II/III, deactivation sets from Table VI, ASM timing from Table I. Reproduces Table VII exactly. |
 | Mobility | `mobility.py` | Hsu et al. (INFOCOM 2007) time-variant community model: normal and concentration movement periods, local/roaming Markov chain, random-direction epochs, POI communities (Sec. V extension). |
+
+### HetNet topology
+
+Configured in `SimConfig.hetnet` ([config.py](oran_asm_sim/config.py)). Each tier is a `TierConfig` whose fields override `RadioConfig` for that tier's sectors; UE-side, MIMO, CQI, shadowing and handover parameters are shared from `radio`.
+
+| | Macro (`hetnet.macro`) | mmWave (`hetnet.small`) |
+|---|---|---|
+| Sites | `round(n_layout_sites / mmwave_per_macro)` tri-sector sites (at least 1; `mmwave_per_macro = 6`), 25 m or roof + mast | the `geometry.layout` sites; any within `macro_exclusion_m` (50 m) of a macro are dropped |
+| Carrier / BW | 6 GHz, 40 MHz (widened from 20 MHz for busy-hour capacity) | 35 GHz, 100 MHz |
+| Numerology | μ = 1: 30 kHz SCS, 0.5 ms slot, 106 PRB (TS 38.101-1) | μ = 3: 120 kHz SCS, 0.125 ms slot, 66 PRB (TS 38.101-2) |
+| RBG / overhead | 16 PRB (7 RBGs), 14 % (FR1) | 8 PRB (9 RBGs), 18 % (FR2) |
+| TX power | 49 dBm per sector (33 dBm/MHz), 4 chains | 35 dBm per sector (15 dBm/MHz), 2 chains |
+| Path loss | TR 38.901 UMa | TR 38.901 UMi street canyon |
+| Antenna | 17 dBi, 65°/10°, 6° downtilt | 26 dBi (8×8 panel: 8 dBi element + 18 dB array gain), 65°/10°, tilt aimed at `tilt_ground_m` |
+| Sleep control | none: always on, not an agent | per sector, commands 0–4 |
+
+- **Macro placement.** A single macro sits at the area centre. Several are placed as the generators of a centroidal Voronoi tessellation of the study area (k-means++ then Lloyd's algorithm on an area grid, seed `macro_layout_seed`), so each covers an umbrella cell of about equal area. The macros come first in the site list (`dep.site_tier == 0`). Override the count with `n_macro` or the positions with `macro_latlons=[(lat, lon), ...]`.
+- **Separate carriers.** Interference is intra-tier only. Each tier has its own PRB grid (padded to a common RBG axis), slot length, noise per PRB (+6 dB at 120 kHz), O2I penetration loss at its own frequency, and power model.
+- **Cell selection** is max RSRP per RE over cells that are on and above `rsrp_min_dbm`, plus the tier's `rsrp_offset_db` (cell range expansion bias: 10 dB for mmWave, 0 dB for the macro), with `ho_hysteresis_db`.
+- **Power.** Each tier runs the Usman et al. model with its own bandwidth, chain count and per-chain PA output. At full load the macro draws about 194 W per sector (idle 92 W, SM1 15 W, SM4 4 W) and an mmWave sector about 121 W (idle 80 W, SM1 50 W, SM2 22 W, SM3 14 W, SM4 8 W). In sleep, the components that stay on are evaluated at the active-idle operating point (`PowerConfig.sleep_component_load = "idle"`). The paper's Table VII convention (`"reference"`, still the homogeneous default) counts them at full load, which for the low-PA-power mmWave O-RU would put SM1 above active-idle. The model was calibrated for a sub-6 GHz 4T4R O-RU, so the mmWave numbers are an extrapolation. Override them per tier with `TierConfig.power` (a dict of `PowerConfig` fields).
 
 ### Power model (per sector, 4T4R, Table V operating point)
 
@@ -402,10 +434,10 @@ Timings are from a 2-core cloud VM with numpy 2, running a single process.
 
 | Preset | Layout | Sites / sectors / UEs | ms per 1 s step (night / busy hour) |
 |---|---|---|---|
-| `dtla_full` (default) | viewshed placement | 45 / 135 / 1350 | ~70 / ~150 |
-| `dtla_hex` | hex fill, geometric LOS | 45 / 135 / 1350 | ~75 / ~130 |
-| `dtla_19site` | 19-site rings | 19 / 57 / 570 | ~30 / ~65 |
-| `fast` | 7-site rings, 5 mini-periods, 300-step episodes | 7 / 21 / 210 | ~8 / ~20 |
+| `dtla_full` (default) | 8 macros + 44 viewshed-placed mmWave sites | 52 / 156 / 1560 | ~70 / ~150 |
+| `dtla_hex` | 8 macros + hex fill, geometric LOS | 53 / 159 / 1590 | ~75 / ~130 |
+| `dtla_19site` | 3 macros + 19-site rings | 22 / 66 / 660 | ~30 / ~65 |
+| `fast` | 7-site rings (macro + 6), 5 mini-periods, 300-step episodes | 7 / 21 / 210 | ~8 / ~20 |
 
 MIMO fading and CQI are only computed for UEs with data, so cost scales with the number of backlogged UEs. RLlib parallelises across env runners.
 
@@ -413,7 +445,24 @@ MIMO fading and CQI are only computed for UEs with data, so cost scales with the
 
 ## Baseline results
 
-These are the results of `python examples/run_baselines.py` (seed 7) on the default viewshed placement over the **synthetic** city: 45 sites, 135 sectors, 1350 UEs. Each hour of the day is simulated for 60 s at 1 s / 100 ms resolution, after a 20 s always-on warm-up. Daily energy is the sum of the hourly mean power. The busy hour runs at about 35 % PRB utilisation.
+These are the results of `python examples/run_baselines.py` (seed 7) on the default HetNet: 8 always-on macro O-RUs (40 MHz) and 44 viewshed-placed mmWave O-RUs over the **synthetic** city (156 sectors, 1560 UEs, 10 dB mmWave CRE). Each hour of the day is simulated for 60 s at 1 s / 100 ms resolution, after a 20 s always-on warm-up. Daily energy is the sum of the hourly mean power. The policies only act on the mmWave sectors.
+
+| Policy | kWh/day (macro + mmWave) | Saving | UEs over delay budget (mean / busy hour) | Outage | UE tput mean / p5 | HO per UE-hour (forced) |
+|---|---|---|---|---|---|---|
+| Always on (no ASM) | 384 (111 + 273) | – | 15.8 % / 27.4 % | 17.0 % | 4.22 / 0.157 Mb/s | 9.4 (0 %) |
+| Opportunistic SM1 | 319 (111 + 208) | 16.9 % | 15.8 % / 27.2 % | 17.0 % | 4.24 / 0.157 Mb/s | 9.1 (0 %) |
+| Opportunistic SM2 | 260 (111 + 149) | 32.2 % | 15.8 % / 27.3 % | 17.0 % | 4.24 / 0.160 Mb/s | 9.4 (0 %) |
+| Opportunistic SM3 | 278 (111 + 167) | 27.5 % | 15.9 % / 26.9 % | 17.0 % | 4.22 / 0.154 Mb/s | 9.2 (0 %) |
+| Threshold SM4 + SM2 | 237 (112 + 124) | 38.3 % | 17.7 % / 28.8 % | 17.2 % | 4.08 / 0.169 Mb/s | 19.2 (39 %) |
+
+`results/kpis_hourly.png` shows energy per hour, handovers, outage and UE throughput per hour of the day; `results/hourly.csv` holds the same data as a table.
+
+- **Energy.** The macros draw a near-constant 4.6 kW (111 kWh/day), which no policy can touch. SM2 still beats SM3 for the reason given below. Threshold SM4 more than halves the mmWave energy but doubles the handovers (39 % of them forced by cells switching off) and adds about 2 points of QoS violation.
+- **Macro bandwidth.** The macro carrier was widened from 20 to 40 MHz for busy-hour capacity. About half the attached UEs are indoor, where 35 GHz cannot reach, so they sit on the macros. With 20 MHz, 31 % of UEs were over the delay budget (44 % in the busy hour) and 58 % of offered traffic was served. Adding macros (1 per 3 or 1 per 2 mmWave sites) made QoS *worse*, because they cover more indoor UEs and pull UEs off mmWave cells. Densifying mmWave to 120 sites helped modestly at 2.5× the power. Spreading 49 dBm over twice the PRBs lowers the RSRP per RE by 3 dB, which raised the outage from 14 % to 17 %.
+- **Served traffic** is 69 % of offered. Most of the gap is traffic offered by UEs in outage (`blocked_frac`) and by attached UEs below the lowest CQI (next bullet). The homogeneous 3.5 GHz network served 97 % with 0.5 % over budget, at 708 kWh/day.
+- **5th-percentile throughput is 0 at night.** The coverage threshold (`radio.rsrp_min_dbm = -130` dBm/RE) is below the lowest CQI: noise per RE is about −120 dBm at 30 kHz and −114 dBm at 120 kHz. So some attached UEs sit below −6.7 dB SINR and are never served. At night they are more than 5 % of the UEs with data. The 10 dB CRE adds to this by pulling some UEs onto weak mmWave links.
+
+For comparison, the homogeneous 3.5 GHz network (`hetnet.enabled=False`, 45 sites, 135 sectors, 1350 UEs, earlier version of the simulator):
 
 | Policy | kWh/day | Saving | UEs over delay budget (mean / busy hour) | Outage | Wake latency |
 |---|---|---|---|---|---|
@@ -423,8 +472,9 @@ These are the results of `python examples/run_baselines.py` (seed 7) on the defa
 | Opportunistic SM3 | 446 | 37.0 % | 0.47 % / 1.30 % | 2.67 % | 2.66 ms |
 | Threshold SM4 + SM2 | 377 | 46.9 % | 0.50 % / 1.37 % | 2.75 % | 0.30 ms |
 
-SM3 saves *less* than SM2. With a 20 ms SSB period, each idle gap pays 10 ms of SM3 transitions at transition power, while SM2 pays only 1 ms, so under this calibration SM2 at 40 W beats SM3 at 28 W.
+SM3 saves *less* than SM2. With a 20 ms SSB period, each idle gap pays 10 ms of SM3 transitions at transition power, while SM2 pays only 1 ms, so SM2's lower transition overhead outweighs SM3's lower sleep power.
 
+![hourly KPIs](results/kpis_hourly.png)
 ![placement](results/placement.png)
 ![daily profile](results/daily_profile.png)
 ![map](results/dtla_map.png)
@@ -436,7 +486,8 @@ SM3 saves *less* than SM2. With a 20 ms SSB period, each idle gap pays 10 ms of 
 Read these before publishing results from the simulator.
 
 - **Downlink only.** TDD is modelled as a DL fraction. There is no UL traffic and no UL power.
-- **Outage.** About 2.5–5 % of UEs are in outage (RSRP < −130 dBm/RE). These are deep-indoor UEs (half of buildings are high-loss IRR glass) that a 3.5 GHz macro-only grid cannot reach. With imported geometry, a UE is indoor exactly when it is inside a footprint; without geometry, 80 % of paused UEs are indoor. Their traffic counts as `blocked_frac`. Tune `radio.paused_indoor_prob`, `radio.high_loss_building_prob` or `radio.rsrp_min_dbm` to change this.
+- **HetNet coverage and load balance.** With 8 macros at 20 MHz, about 16 % of UEs were in outage at noon with every cell on and about 18 % with every mmWave cell in SM4; a single macro gave 26 % / 41 %. The default 40 MHz macros raise the outage to about 17 % (3 dB lower RSRP per RE). The remaining outage is deep indoor: 35 GHz O2I loss shuts out the mmWave tier and 6 GHz high-loss buildings are hard to reach. With 20 MHz macros and 0 dB CRE, max-RSRP selection put about 70 % of attached UEs on the macros, which congested (52 % of UEs over the delay budget at noon). The defaults (10 dB mmWave CRE, 40 MHz macros) bring the busy-hour QoS violations to about 27 %, at the cost of about 17 % outage (see [Baseline results](#baseline-results)).
+- **Outage (homogeneous network).** About 2.5–5 % of UEs are in outage (RSRP < −130 dBm/RE). These are deep-indoor UEs (half of buildings are high-loss IRR glass) that a 3.5 GHz macro-only grid cannot reach. With imported geometry, a UE is indoor exactly when it is inside a footprint; without geometry, 80 % of paused UEs are indoor. Their traffic counts as `blocked_frac`. Tune `radio.paused_indoor_prob`, `radio.high_loss_building_prob` or `radio.rsrp_min_dbm` to change this.
 - **Link abstraction.** Ideal CSI, single-user MIMO and no HARQ timeline. Goodput = CQI efficiency × (1 − BLER target). Interferers are treated as spatially white, with per-RBG on/off activity driven by each sector's last utilisation.
 - **CQI thresholds** are the commonly used AWGN 10 %-BLER switching points, not a 3GPP-normative table.
 - **No wrap-around.** The area is real and finite, so edge sites see less interference.

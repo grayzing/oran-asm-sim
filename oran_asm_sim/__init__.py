@@ -1,13 +1,13 @@
 """oran_asm_sim - vectorised 3GPP-style system-level simulator for per-sector
 O-RU Advanced Sleep Mode (ASM) control, packaged as Gymnasium / RLlib envs."""
-from .config import (EnvConfig, GeometryConfig, MobilityConfig, PeriodConfig, PowerConfig,
-                     RadioConfig, SimConfig, TrafficConfig)
+from .config import (EnvConfig, GeometryConfig, HetNetConfig, MobilityConfig, PeriodConfig, PowerConfig,
+                     RadioConfig, SimConfig, TierConfig, TrafficConfig)
 from .env import ORanASMEnv, ORanASMMultiAgentEnv
 from .power import ASM_TIMING, ORUPowerModel
 from .simulator import ORANSystemSimulator
 
 __all__ = ["SimConfig", "GeometryConfig", "RadioConfig", "MobilityConfig", "PeriodConfig",
-           "TrafficConfig", "PowerConfig", "EnvConfig", "ORANSystemSimulator", "ORanASMEnv",
+           "TrafficConfig", "PowerConfig", "EnvConfig", "HetNetConfig", "TierConfig", "ORANSystemSimulator", "ORanASMEnv",
            "ORanASMMultiAgentEnv", "ORUPowerModel", "ASM_TIMING", "register"]
 __version__ = "0.2.0"
 
