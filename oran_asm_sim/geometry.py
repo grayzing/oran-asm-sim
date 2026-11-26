@@ -401,11 +401,15 @@ def load_building_raster(geo: GeometryConfig, proj, area_min, area_max, bbox):
     cpath = os.path.join(cache_dir, f"raster_{key}.npz")
     if os.path.exists(cpath):
         z = np.load(cpath)
-        return BuildingRaster(z["h"], z["origin"], float(z["res"]), int(z["n"])), source, path
-    r = BuildingRaster.from_file(path, proj, area_min, area_max, geo.building_raster_res_m,
-                                 geo.building_default_height_m, geo.building_height_scale,
-                                 geo.building_height_field)
-    np.savez_compressed(cpath, h=r.h, origin=r.origin, res=r.res, n=r.n_buildings)
+        r = BuildingRaster(z["h"], z["origin"], float(z["res"]), int(z["n"]))
+    else:
+        r = BuildingRaster.from_file(path, proj, area_min, area_max, geo.building_raster_res_m,
+                                     geo.building_default_height_m, geo.building_height_scale,
+                                     geo.building_height_field)
+        np.savez_compressed(cpath, h=r.h, origin=r.origin, res=r.res, n=r.n_buildings)
+    if r.n_buildings == 0:
+        warnings.warn(f"no buildings from {path} fall inside the study bbox {tuple(bbox)} (S, W, N, E); "
+                      "was the file fetched for a different area?", stacklevel=3)
     return r, source, path
 
 

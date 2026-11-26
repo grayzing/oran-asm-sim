@@ -172,7 +172,9 @@ def place_sites(raster, geo: GeometryConfig, radio: RadioConfig, verbose: bool =
     rng = np.random.default_rng(geo.placement_seed)
     cand_xy, cand_roof = find_candidates(raster, geo, rng)
     if len(cand_xy) == 0:
-        raise ValueError("no rooftop candidates found; check building heights / cand_min_height_m")
+        raise ValueError(
+            f"no rooftop candidates found ({raster.n_buildings} buildings in the study area); check that "
+            "buildings_geojson covers geometry.bbox, building heights / cand_min_height_m, and fill_margin_m")
     cand_h = cand_roof + geo.mast_height_m
     sa = raster.outdoor.reshape(-1)
     sa_idx = np.full(n_cells, -1, np.int64)
